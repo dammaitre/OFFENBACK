@@ -23,6 +23,7 @@ const LOG_CAPACITY: usize = 500;
 const SUSTAIN_CC: u8 = 64;
 /// Buffer sizes offered with `[` / `]`; past the end means "server default".
 const BUFFER_SIZES: [u32; 6] = [32, 64, 128, 256, 512, 1024];
+const DEFAULT_BUFFER: u32 = 128;
 const TEST_NOTE: u8 = 60;
 const TEST_NOTE_LENGTH: Duration = Duration::from_millis(600);
 
@@ -71,7 +72,8 @@ impl App {
     pub fn new(output: Option<String>, buffer: Option<u32>) -> Self {
         let (ui_tx, ui_rx) = crossbeam_channel::bounded(4096);
         let (engine_tx, engine_rx) = crossbeam_channel::bounded(1024);
-        let buffer = buffer.map(|b| {
+        // The server default is often 1024 frames (~43 ms on built-in speakers); ask for less.
+        let buffer = Some(buffer.unwrap_or(DEFAULT_BUFFER)).map(|b| {
             BUFFER_SIZES.iter().position(|&s| s >= b).unwrap_or(BUFFER_SIZES.len() - 1)
         });
         let mut app = Self {

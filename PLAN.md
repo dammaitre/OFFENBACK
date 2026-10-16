@@ -29,7 +29,7 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 
 ## Milestones
 1. ✅ **Skeleton**: cargo project, choose a MIDI port in the TUI, live event log (test with `fake_keyboard`).
-2. **Audio out**: pick output device, sine-synth voices, measure latency on wired output, buffer size setting.
+2. ✅ **Audio out**: pick output device, sine-synth voices, measure latency on wired output, buffer size setting.
 3. **.sts reader + sampler**: parse the container, decode Opus to f32 in RAM, map the Piano, velocity layers, release envelope.
 4. **Transform stage**: velocity curve (editable points), auto-sustain, CC64 passthrough, transpose, detune.
 5. **FX**: low-pass/cutoff, reverb, master gain + limiter.
@@ -44,3 +44,15 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 | Audio buffer (64–128 frames @ 48 kHz) | 1.3–2.7 ms (×2 for double buffering) |
 | **Bluetooth SBC (both devices)** | **~150–250 ms, outside our control** |
 | A70 on the wired jack | ≈ 0 ms extra |
+
+### Measured (2026-10-16, native PipeWire backend)
+Estimated key → sound, as reported by PipeWire (no acoustic measurement yet):
+
+| Output | Buffer | Output delay | App total (last note) |
+|---|---|---|---|
+| Null test sink | 32 / 64 / 128 / 256 | 0.7 / 1.3 / 2.7 / 5.3 ms | 1.3 / 2.2 / 3.8 / 8.1 ms |
+| Laptop speakers | 128 / 1024 | 5.3 / 42.7 ms | |
+| OneOdio A70, Bluetooth SBC (public or `.1` direct node) | 128 | ~207 ms | |
+
+The same thing through ALSA's pipewire plugin at 128 frames: 6.4 ms (vs 3.8 native).
+The A70 sink caps the graph at 256 frames when asked for more.

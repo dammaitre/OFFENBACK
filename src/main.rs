@@ -14,7 +14,7 @@ Usage: offenback [OPTIONS]
   --list-outputs    print audio outputs and exit
   --port NAME       connect to the first MIDI port containing NAME, skipping the picker
   --output NAME     play through the first audio output whose id or name contains NAME
-  --buffer FRAMES   audio buffer size (32..1024); default lets the audio server choose";
+  --buffer FRAMES   audio buffer size, 32..1024 (default 128); `]` past 1024 lets the server choose";
 
 fn main() -> Result<()> {
     let mut port = None;

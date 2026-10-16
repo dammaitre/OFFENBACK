@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, StreamConfig};
+use cpal::{BufferSize, DeviceDirection, FromSample, SampleFormat, SizedSample, StreamConfig};
 use crossbeam_channel::Receiver;
 
 use crate::engine::{Engine, EngineCmd, Stats};
@@ -28,14 +28,31 @@ pub fn host_name() -> String {
 
 pub fn list_outputs() -> Result<Vec<OutputInfo>> {
     let host = cpal::default_host();
+    let pipewire = host.id().name() == "PipeWire";
     Ok(host
         .output_devices()
         .context("cannot enumerate audio outputs")?
         .filter_map(|d| {
-            Some(OutputInfo {
-                id: d.id().ok()?.id().to_owned(),
-                name: d.description().ok()?.name().to_owned(),
-            })
+            let id = d.id().ok()?.id().to_owned();
+            let desc = d.description().ok()?;
+            let mut name = desc.name().to_owned();
+            if pipewire {
+                match id.as_str() {
+                    "output_default" => name = "System default".into(),
+                    // Same thing as output_default.
+                    "sink_default" => return None,
+                    // Other applications' playback streams, not places to send sound.
+                    _ if desc.direction() == DeviceDirection::Output => return None,
+                    // PipeWire ≥ 1.4 puts a public sink in front of the codec node; the
+                    // internal one skips that hop, which may matter for latency.
+                    _ if id.starts_with("bluez_output.") && id.ends_with(".1") => {
+                        name += " (Bluetooth, direct)"
+                    }
+                    _ if id.starts_with("bluez_output.") => name += " (Bluetooth)",
+                    _ => {}
+                }
+            }
+            Some(OutputInfo { id, name })
         })
         .collect())
 }
