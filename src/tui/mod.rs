@@ -78,6 +78,8 @@ pub struct App {
     buffer: Option<usize>,
     test_note_off: Option<Instant>,
     params: Params,
+    /// What the engine has; `None` forces a resend (e.g. after reopening the stream).
+    params_sent: Option<Params>,
     /// Index into `ParamId::ALL`.
     selected: usize,
     /// First visible matrix column when the terminal is too narrow for all of them.
@@ -124,6 +126,7 @@ impl App {
             buffer,
             test_note_off: None,
             params: Params::default(),
+            params_sent: None,
             selected: 0,
             matrix_scroll: 0,
             cell_rects: Vec::new(),
@@ -172,6 +175,11 @@ impl App {
         while !self.quit {
             self.drain_events();
             self.poll_loading();
+            if self.params_sent != Some(self.params)
+                && self.engine_tx.try_send(EngineCmd::Params(self.params)).is_ok()
+            {
+                self.params_sent = Some(self.params);
+            }
             while self.garbage_rx.try_recv().is_ok() {}
             if self.test_note_off.is_some_and(|t| Instant::now() >= t) {
                 self.test_note_off = None;
@@ -246,6 +254,7 @@ impl App {
         );
         match result {
             Ok(out) => {
+                self.params_sent = None;
                 self.audio_error = None;
                 self.status = format!("audio → {}", out.device_name);
                 self.audio = Some(out);
@@ -428,7 +437,8 @@ impl App {
         if let Some(list) = self.popup_list() {
             if up { list.select_previous() } else { list.select_next() }
         } else {
-            self.params.nudge(ParamId::ALL[self.selected], if up { 1 } else { -1 });
+            // Reversed on request: matches natural (touchpad) scrolling.
+            self.params.nudge(ParamId::ALL[self.selected], if up { -1 } else { 1 });
         }
     }
 }

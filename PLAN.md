@@ -37,7 +37,10 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 3b. ✅ **UI redesign**: top bar (held/sustain lights, port, output), effects matrix (arrows select,
    touchpad scroll adjusts), mini keyboard, popups for Port / Output (buffer, latency) / Instrument.
    Parameters are not yet wired to sound.
-4. **Transform stage**: velocity curve (editable points), auto-sustain, CC64 passthrough, transpose, detune.
+4. ✅ **Matrix wired to the engine**: Volume (smoothed master gain), Transpose (note remap, releases follow
+   the note-on), Detune (live), Attack (added fade-in), Decay/Sustain (extra fade, off by default), Release
+   (× instrument release), Low/High pass (12 dB/oct master filters, gliding), Velocity touch curve.
+   Limiter is now transparent below -2 dBFS. Auto-sustain: semantics to decide.
 5. **FX**: low-pass/cutoff, reverb, master gain + limiter.
 6. **Profiles**: TOML files in `soundsprofiles/`, load/save/switch while playing.
 7. **Recording**: tap the master bus and write a WAV in a non-real-time thread (also write MIDI).

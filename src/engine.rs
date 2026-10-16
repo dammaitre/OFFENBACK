@@ -12,6 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::instrument::{CC_COUNT, Ctx, FilterKind, Instrument, Region, Trigger};
 use crate::midi::MidiEvent;
+use crate::params::{ParamId, Params, velocity_gamma};
 
 const MAX_VOICES: usize = 128;
 const BEND_RANGE_CENTS: f32 = 200.0;
@@ -22,11 +23,55 @@ const SILENCE: f32 = 1e-4;
 const LN_1000: f32 = 6.907_755;
 const ALL_SOUND_OFF_CC: u8 = 120;
 const ALL_NOTES_OFF_CC: u8 = 123;
+/// Master filters at these cutoffs are bypassed.
+const LOW_PASS_OFF_HZ: f32 = 19_900.0;
+const HIGH_PASS_OFF_HZ: f32 = 20.5;
 
 pub enum EngineCmd {
     /// `at` is when the event reached us, for latency measurement.
     Midi { event: MidiEvent, at: Instant },
     SetInstrument(Arc<Instrument>),
+    Params(Params),
+}
+
+/// The effects matrix, converted to what the audio thread needs.
+#[derive(Clone, Copy)]
+struct User {
+    gain: f32,
+    transpose: i32,
+    detune: f32,
+    attack_s: f32,
+    /// Extra fade time and its floor; `None` when Decay is off.
+    decay_s: Option<f32>,
+    sustain: f32,
+    release_mult: f32,
+    low_pass_hz: f32,
+    high_pass_hz: f32,
+    vel_gamma: f32,
+}
+
+impl User {
+    fn new(p: &Params) -> Self {
+        Self {
+            gain: db_to_gain(p.get(ParamId::Volume)),
+            transpose: p.get(ParamId::Transpose).round() as i32,
+            detune: 2f32.powf(p.get(ParamId::Detune) / 1200.0),
+            attack_s: p.get(ParamId::Attack) / 1000.0,
+            decay_s: (!p.is_default(ParamId::Decay)).then(|| p.get(ParamId::Decay)),
+            sustain: p.get(ParamId::Sustain) / 100.0,
+            release_mult: p.get(ParamId::Release),
+            low_pass_hz: p.get(ParamId::LowPass),
+            high_pass_hz: p.get(ParamId::HighPass),
+            vel_gamma: velocity_gamma(p.get(ParamId::Velocity)),
+        }
+    }
+
+    fn velocity(&self, vel: u8) -> u8 {
+        if vel == 0 || self.vel_gamma == 1.0 {
+            return vel;
+        }
+        ((vel as f32 / 127.0).powf(self.vel_gamma) * 127.0).round().clamp(1.0, 127.0) as u8
+    }
 }
 
 /// Numbers the audio thread publishes for the UI. All values are "last seen" unless noted.
@@ -179,6 +224,13 @@ struct Biquad {
 
 impl Biquad {
     fn new(kind: FilterKind, cutoff: f32, resonance_db: f32, sr: f32) -> Self {
+        let mut f = Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z: [[0.0; 2]; 2] };
+        f.set(kind, cutoff, resonance_db, sr);
+        f
+    }
+
+    /// Updates the coefficients, keeping the filter state (no click when sweeping).
+    fn set(&mut self, kind: FilterKind, cutoff: f32, resonance_db: f32, sr: f32) {
         let fc = cutoff.clamp(10.0, 0.45 * sr);
         let w0 = std::f32::consts::TAU * fc / sr;
         let (b0, b1, b2, a1, a2) = match kind {
@@ -206,7 +258,7 @@ impl Biquad {
                 (b0 / a0, b1 / a0, b2 / a0, -2.0 * cos / a0, (1.0 - alpha) / a0)
             }
         };
-        Self { b0, b1, b2, a1, a2, z: [[0.0; 2]; 2] }
+        (self.b0, self.b1, self.b2, self.a1, self.a2) = (b0, b1, b2, a1, a2);
     }
 
     #[inline]
@@ -241,6 +293,10 @@ struct Voice {
     step: f64,
     gain: [f32; 2],
     env: Env,
+    /// Extra Decay/Sustain fade from the matrix, on top of the instrument envelope.
+    fade: f32,
+    fade_floor: f32,
+    fade_coef: f32,
     filter: Option<Biquad>,
     /// Key physically held down.
     key_down: bool,
@@ -273,6 +329,9 @@ impl Voice {
             release_coef: 0.0,
             release_after_attack: false,
         },
+        fade: 1.0,
+        fade_floor: 1.0,
+        fade_coef: 1.0,
         filter: None,
         key_down: false,
         sustained: false,
@@ -287,7 +346,17 @@ pub struct Engine {
     voices: Vec<Voice>,
     ccs: [f32; CC_COUNT],
     bend: f32,
+    user: User,
+    /// Smoothed master gain.
+    gain: f32,
+    gain_step: f32,
+    low_pass: Biquad,
+    high_pass: Biquad,
+    low_pass_hz: f32,
+    high_pass_hz: f32,
     sw_last: Option<u8>,
+    /// Sounding note for each held input key (input key + transpose at note-on time).
+    key_map: [Option<u8>; 128],
     key_vel: [u8; 128],
     key_time: [u64; 128],
     key_held: [bool; 128],
@@ -320,6 +389,14 @@ impl Engine {
             inst,
             voices: vec![Voice::IDLE; MAX_VOICES],
             bend: 1.0,
+            user: User::new(&Params::default()),
+            gain: 1.0,
+            gain_step: 1.0 - (-1.0 / (0.01 * sr)).exp(),
+            low_pass: Biquad::new(FilterKind::Lpf2p, 20_000.0, 0.0, sr),
+            high_pass: Biquad::new(FilterKind::Hpf2p, 20.0, 0.0, sr),
+            low_pass_hz: 20_000.0,
+            high_pass_hz: 20.0,
+            key_map: [None; 128],
             key_vel: [0; 128],
             key_time: [0; 128],
             key_held: [false; 128],
@@ -351,6 +428,7 @@ impl Engine {
                     self.handle(event);
                 }
                 EngineCmd::SetInstrument(inst) => self.set_instrument(inst),
+                EngineCmd::Params(p) => self.user = User::new(&p),
             }
         }
         self.stats.output_us.store(output_delay_us, Relaxed);
@@ -405,11 +483,17 @@ impl Engine {
             })
     }
 
-    fn note_on(&mut self, note: u8, vel: u8) {
-        if self.is_keyswitch(note) {
-            self.sw_last = Some(note);
+    fn note_on(&mut self, key: u8, vel: u8) {
+        if self.is_keyswitch(key) {
+            self.sw_last = Some(key);
             return;
         }
+        let Ok(note) = u8::try_from(key as i32 + self.user.transpose) else { return };
+        if note > 127 {
+            return;
+        }
+        let vel = self.user.velocity(vel);
+        self.key_map[key as usize] = Some(note);
         let n = note as usize;
         self.key_vel[n] = vel;
         self.key_time[n] = self.clock;
@@ -426,10 +510,12 @@ impl Engine {
         }
     }
 
-    fn note_off(&mut self, note: u8) {
-        if self.is_keyswitch(note) {
+    fn note_off(&mut self, key: u8) {
+        if self.is_keyswitch(key) {
             return;
         }
+        // Use the transpose of the note-on, even if it changed while the key was down.
+        let Some(note) = self.key_map[key as usize].take() else { return };
         let n = note as usize;
         self.key_held[n] = false;
         let sustain = self.sustain_down();
@@ -520,8 +606,8 @@ impl Engine {
     fn release_voice(&mut self, inst: &Instrument, i: usize) {
         let v = self.voices[i];
         let r = &inst.regions[v.region as usize];
-        let seconds = r.ampeg.release.eval(&self.ctx(inst, v.note, v.vel)).max(0.0005);
-        self.voices[i].env.release(seconds, self.sr);
+        let seconds = r.ampeg.release.eval(&self.ctx(inst, v.note, v.vel)) * self.user.release_mult;
+        self.voices[i].env.release(seconds.max(0.0005), self.sr);
     }
 
     /// Fades a voice out because something else took its place.
@@ -602,7 +688,7 @@ impl Engine {
         let e = &r.ampeg;
         let env = Env::new(
             e.delay.eval(&ctx),
-            e.attack.eval(&ctx),
+            e.attack.eval(&ctx) + self.user.attack_s,
             e.hold.eval(&ctx),
             e.decay.eval(&ctx),
             e.sustain.eval(&ctx),
@@ -626,6 +712,9 @@ impl Engine {
             step,
             gain: [gain * (1.0 - pan).min(1.0), gain * (1.0 + pan).min(1.0)],
             env,
+            fade: 1.0,
+            fade_floor: self.user.decay_s.map_or(1.0, |_| self.user.sustain),
+            fade_coef: self.user.decay_s.map_or(1.0, |t| exp_coef(t, self.sr)),
             filter,
             key_down: r.trigger == Trigger::Attack,
             sustained: false,
@@ -647,8 +736,9 @@ impl Engine {
     /// Fills `out` with stereo frames.
     pub fn render(&mut self, out: &mut [[f32; 2]]) {
         out.fill([0.0; 2]);
+        self.update_master_filters(out.len());
         let inst = &*self.inst;
-        let bend = self.bend as f64;
+        let bend = (self.bend * self.user.detune) as f64;
         let mut active = 0;
         for v in self.voices.iter_mut().filter(|v| v.active) {
             let s = &inst.samples[inst.regions[v.region as usize].sample];
@@ -677,6 +767,8 @@ impl Engine {
                     l = f.process(0, l);
                     r = f.process(1, r);
                 }
+                v.fade = v.fade_floor + (v.fade - v.fade_floor) * v.fade_coef;
+                let e = e * v.fade;
                 frame[0] += l * v.gain[0] * e;
                 frame[1] += r * v.gain[1] * e;
                 v.pos += step;
@@ -686,9 +778,19 @@ impl Engine {
             }
         }
 
+        let lp_on = self.low_pass_hz < LOW_PASS_OFF_HZ;
+        let hp_on = self.high_pass_hz > HIGH_PASS_OFF_HZ;
         for frame in out.iter_mut() {
-            for s in frame.iter_mut() {
-                *s = soft_clip(*s * MASTER_GAIN);
+            self.gain += (self.user.gain - self.gain) * self.gain_step;
+            for (c, s) in frame.iter_mut().enumerate() {
+                let mut x = *s;
+                if lp_on {
+                    x = self.low_pass.process(c, x);
+                }
+                if hp_on {
+                    x = self.high_pass.process(c, x);
+                }
+                *s = soft_clip(x * self.gain * MASTER_GAIN);
             }
             let level = frame[0].abs().max(frame[1].abs());
             self.peak = if level > self.peak { level } else { self.peak * self.peak_fall };
@@ -699,10 +801,43 @@ impl Engine {
     }
 }
 
-/// Smooth limiter: rational tanh approximation, nearly linear below ~0.3, saturates at ±1.
+impl Engine {
+    /// Glides the master filter cutoffs towards their targets (~30 ms, log domain).
+    fn update_master_filters(&mut self, frames: usize) {
+        let k = 1.0 - (-(frames as f32) / (0.03 * self.sr)).exp();
+        let glide = |current: &mut f32, target: f32| -> bool {
+            if (*current / target - 1.0).abs() < 1e-3 {
+                let changed = *current != target;
+                *current = target;
+                return changed;
+            }
+            *current = (current.ln() + (target.ln() - current.ln()) * k).exp();
+            true
+        };
+        if glide(&mut self.low_pass_hz, self.user.low_pass_hz) {
+            self.low_pass.set(FilterKind::Lpf2p, self.low_pass_hz, 0.0, self.sr);
+        }
+        if glide(&mut self.high_pass_hz, self.user.high_pass_hz) {
+            self.high_pass.set(FilterKind::Hpf2p, self.high_pass_hz, 0.0, self.sr);
+        }
+    }
+}
+
+/// Untouched below this level (-2 dBFS); above it the signal bends smoothly towards ±1.
+const CLIP_KNEE: f32 = 0.8;
+
+/// Safety limiter: exactly linear up to `CLIP_KNEE`, then a tanh-shaped knee that never
+/// exceeds ±1. Normal playing never reaches the knee, so it adds no colouring.
 fn soft_clip(x: f32) -> f32 {
-    let x = x.clamp(-3.0, 3.0);
-    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+    let a = x.abs();
+    if a <= CLIP_KNEE {
+        return x;
+    }
+    let room = 1.0 - CLIP_KNEE;
+    let over = ((a - CLIP_KNEE) / room).min(3.0);
+    // Rational tanh approximation, reaches exactly 1 at 3.
+    let bent = over * (27.0 + over * over) / (27.0 + 9.0 * over * over);
+    (CLIP_KNEE + room * bent).copysign(x)
 }
 
 #[cfg(test)]
@@ -743,6 +878,26 @@ mod tests {
 
         fn active(&self) -> usize {
             self.engine.voices.iter().filter(|v| v.active).count()
+        }
+
+        fn set(&mut self, edits: &[(ParamId, i32)]) {
+            let mut p = Params::default();
+            for &(id, steps) in edits {
+                p.nudge(id, steps);
+            }
+            self.tx.send(EngineCmd::Params(p)).unwrap();
+            self.engine.begin_callback(self.buf.len(), 0);
+        }
+
+        /// RMS of the left channel over `seconds`.
+        fn rms(&mut self, seconds: f32) -> f32 {
+            let blocks = (seconds * SR as f32 / self.buf.len() as f32).ceil() as usize;
+            let mut sum = 0.0f64;
+            for _ in 0..blocks {
+                self.engine.render(&mut self.buf);
+                sum += self.buf.iter().map(|f| (f[0] as f64).powi(2)).sum::<f64>();
+            }
+            (sum / (blocks * self.buf.len()) as f64).sqrt() as f32
         }
     }
 
@@ -901,6 +1056,126 @@ mod tests {
         }
         assert!(rig.run(0.1) <= 1.0 + 1e-6);
         assert_eq!(rig.active(), MAX_VOICES);
+    }
+
+    #[test]
+    fn transpose_plays_shifted_note_and_releases_the_right_voice() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Transpose, 12)]);
+        rig.send(on(57, 100));
+        let v = rig.engine.voices.iter().find(|v| v.active).unwrap();
+        assert_eq!(v.note, 69);
+        assert!((v.step - 1.0).abs() < 1e-9, "A3 + 12 plays the A4 sample unshifted");
+        // Changing transpose while held must not orphan the note.
+        rig.set(&[(ParamId::Transpose, -3)]);
+        rig.send(off(57));
+        rig.run(0.5);
+        assert_eq!(rig.active(), 0);
+    }
+
+    #[test]
+    fn velocity_curve_reshapes_touch() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Velocity, 50)]); // light 100 → gamma 0.25
+        rig.send(on(60, 32));
+        let v = rig.engine.voices.iter().find(|v| v.active).unwrap();
+        let expected = ((32.0f32 / 127.0).powf(0.25) * 127.0).round() as u8;
+        assert_eq!(v.vel, expected);
+        assert!(v.vel > 80);
+    }
+
+    #[test]
+    fn volume_scales_output() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.send(on(69, 100));
+        let base = rig.rms(0.1);
+        rig.set(&[(ParamId::Volume, -12)]); // -6 dB
+        rig.run(0.05); // let the gain glide settle
+        let quieter = rig.rms(0.1);
+        // The sample decays on its own, so compare to its expected natural decay too.
+        let db = 20.0 * (quieter / base).log10();
+        assert!(db < -6.0 && db > -9.0, "{db}");
+    }
+
+    #[test]
+    fn detune_changes_pitch_live() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.send(on(69, 100));
+        rig.set(&[(ParamId::Detune, 200)]); // +100 cents
+        assert!((rig.engine.user.detune - 2f32.powf(100.0 / 1200.0)).abs() < 1e-6);
+        let pos0 = rig.engine.voices.iter().find(|v| v.active).unwrap().pos;
+        rig.run(0.01);
+        let pos1 = rig.engine.voices.iter().find(|v| v.active).unwrap().pos;
+        let frames = (0.01f32 * SR as f32 / 256.0).ceil() as f64 * 256.0;
+        assert!(((pos1 - pos0) / frames - 2f64.powf(100.0 / 1200.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn release_multiplier_lengthens_tail() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Release, 80)]); // ×5: 0.08 s → 0.4 s
+        rig.send(on(69, 100));
+        rig.run(0.05);
+        rig.send(off(69));
+        rig.run(0.2);
+        assert_eq!(rig.active(), 1, "still fading after 0.2 s");
+        rig.run(0.5);
+        assert_eq!(rig.active(), 0);
+    }
+
+    #[test]
+    fn attack_adds_fade_in() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Attack, 50)]); // half the square scale: 500 ms
+        rig.send(on(69, 100));
+        rig.run(0.1);
+        let level = rig.engine.voices.iter().find(|v| v.active).unwrap().env.level;
+        assert!(level > 0.15 && level < 0.25, "{level}");
+    }
+
+    #[test]
+    fn decay_fades_towards_sustain() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Decay, -100), (ParamId::Sustain, -50)]); // 0.2 s towards 50 %
+        rig.send(on(69, 100));
+        rig.run(1.0);
+        let fade = rig.engine.voices.iter().find(|v| v.active).unwrap().fade;
+        assert!((fade - 0.5).abs() < 0.01, "{fade}");
+    }
+
+    #[test]
+    fn master_filters_cut() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.send(on(105, 127)); // ~3.5 kHz
+        let open = rig.rms(0.05);
+        rig.send(on(105, 127));
+        rig.set(&[(ParamId::LowPass, -96)]); // ~500 Hz
+        rig.run(0.2);
+        let lp = rig.rms(0.05);
+        assert!(lp < open * 0.1, "low pass: {lp} vs {open}");
+
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.send(on(33, 127)); // 55 Hz
+        let open = rig.rms(0.05);
+        rig.send(on(33, 127));
+        rig.set(&[(ParamId::HighPass, 80)]); // ~1 kHz
+        rig.run(0.2);
+        let hp = rig.rms(0.05);
+        assert!(hp < open * 0.1, "high pass: {hp} vs {open}");
+    }
+
+    #[test]
+    fn limiter_is_transparent_below_knee_and_bounded() {
+        for x in [0.0, 0.1, -0.5, 0.79] {
+            assert_eq!(soft_clip(x), x);
+        }
+        let mut last = soft_clip(CLIP_KNEE);
+        for i in 1..=400 {
+            let y = soft_clip(CLIP_KNEE + i as f32 * 0.02);
+            assert!(y >= last && y <= 1.0, "monotonic and bounded at step {i}: {y}");
+            last = y;
+        }
+        assert_eq!(soft_clip(-10.0), -1.0);
     }
 
     #[test]

@@ -15,11 +15,12 @@ pub enum ParamId {
     Detune,
     LowPass,
     HighPass,
+    Velocity,
 }
 
 impl ParamId {
-    /// Matrix order, 4 per row: level & pitch, envelope, filters.
-    pub const ALL: [ParamId; 10] = [
+    /// Matrix order, 4 per row: level & pitch, envelope, filters & touch.
+    pub const ALL: [ParamId; 11] = [
         ParamId::Volume,
         ParamId::Transpose,
         ParamId::Detune,
@@ -30,6 +31,7 @@ impl ParamId {
         ParamId::Release,
         ParamId::LowPass,
         ParamId::HighPass,
+        ParamId::Velocity,
     ];
 
     pub fn spec(self) -> &'static Spec {
@@ -59,7 +61,7 @@ pub struct Spec {
     default_label: Option<&'static str>,
 }
 
-const SPECS: [Spec; 10] = [
+const SPECS: [Spec; 11] = [
     Spec {
         name: "Volume",
         min: -48.0,
@@ -160,7 +162,22 @@ const SPECS: [Spec; 10] = [
         format: format_hz,
         default_label: Some("off"),
     },
+    Spec {
+        name: "Velocity",
+        min: -100.0,
+        max: 100.0,
+        default: 0.0,
+        scale: Scale::Linear,
+        steps: 100,
+        format: |v| if v > 0.0 { format!("light {v:.0}") } else { format!("heavy {:.0}", -v) },
+        default_label: Some("linear"),
+    },
 ];
+
+/// Touch curve exponent for the Velocity parameter: light (+100) → 0.25, heavy (-100) → 4.
+pub fn velocity_gamma(amount: f32) -> f32 {
+    4f32.powf(-amount / 100.0)
+}
 
 fn format_hz(v: f32) -> String {
     if v >= 1000.0 { format!("{:.1} kHz", v / 1000.0) } else { format!("{v:.0} Hz") }
@@ -194,7 +211,7 @@ impl Spec {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
     values: [f32; SPECS.len()],
 }
