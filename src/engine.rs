@@ -13,6 +13,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::instrument::{CC_COUNT, Ctx, FilterKind, Instrument, Region, Trigger};
 use crate::midi::MidiEvent;
 use crate::params::{ParamId, Params, sustain_seconds, velocity_gamma};
+use crate::recorder::{AudioBlock, BLOCK_FRAMES, RecMsg};
 use crate::reverb::Reverb;
 
 const MAX_VOICES: usize = 128;
@@ -38,6 +39,8 @@ pub enum EngineCmd {
     Midi { event: MidiEvent, at: Instant },
     SetInstrument(Arc<Instrument>),
     Params(Params),
+    /// Start (`Some`) or stop (`None`) copying the master output to a recorder.
+    Record(Option<Sender<RecMsg>>),
 }
 
 /// The matrix's Sustain: how long notes keep ringing after the key is released.
@@ -118,6 +121,8 @@ pub struct Stats {
     pub peak: AtomicU32,
     pub callbacks: AtomicU64,
     pub errors: AtomicU64,
+    /// Audio blocks the recorder could not take (disk too slow).
+    pub rec_dropped: AtomicU64,
 }
 
 impl Stats {
@@ -393,6 +398,7 @@ pub struct Engine {
     /// Smoothed reverb send; the reverb is bypassed (and cleared) once it reaches 0.
     reverb_send: f32,
     reverb_running: bool,
+    recorder: Option<Sender<RecMsg>>,
     sw_last: Option<u8>,
     /// Sounding note for each held input key (input key + transpose at note-on time).
     key_map: [Option<u8>; 128],
@@ -439,6 +445,7 @@ impl Engine {
             reverb: Reverb::new(sr),
             reverb_send: 0.0,
             reverb_running: false,
+            recorder: None,
             key_map: [None; 128],
             key_vel: [0; 128],
             key_time: [0; 128],
@@ -475,6 +482,8 @@ impl Engine {
                     self.user = User::new(&p);
                     self.apply_cc(PEDAL_CC, self.pedal_cc.max(self.user.pedal()));
                 }
+                // The UI keeps its own sender, so dropping ours never wakes a thread from here.
+                EngineCmd::Record(tx) => self.recorder = tx,
             }
         }
         self.stats.output_us.store(output_delay_us, Relaxed);
@@ -882,6 +891,13 @@ impl Engine {
             }
             let level = frame[0].abs().max(frame[1].abs());
             self.peak = if level > self.peak { level } else { self.peak * self.peak_fall };
+        }
+        if let Some(tx) = &self.recorder {
+            let mut block = AudioBlock { len: out.len().min(BLOCK_FRAMES), frames: [[0.0; 2]; BLOCK_FRAMES] };
+            block.frames[..block.len].copy_from_slice(&out[..block.len]);
+            if tx.try_send(RecMsg::Audio(block)).is_err() {
+                self.stats.rec_dropped.fetch_add(1, Relaxed);
+            }
         }
         self.clock += out.len() as u64;
         self.stats.active_voices.store(active, Relaxed);

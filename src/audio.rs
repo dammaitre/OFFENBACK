@@ -15,7 +15,7 @@ use crate::engine::{Engine, EngineCmd, Stats};
 use crate::instrument::Instrument;
 
 /// Frames rendered per engine call; the callback loops when the device asks for more.
-const BLOCK: usize = 256;
+const BLOCK: usize = crate::recorder::BLOCK_FRAMES;
 const SAMPLE_RATE: u32 = 48_000;
 
 pub struct OutputInfo {

@@ -44,8 +44,9 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 5. ✅ **Reverb**: 8-line FDN (pre-delay 20 ms, 4 diffusers, Householder feedback, per-line damping,
    decorrelated stereo), ~2.2 s decay, Reverb cell = send level (100 % ≈ dry level), bypassed at 0.
    Also: samples fade over their last 250 ms (held notes no longer cut off at the end of short recordings).
-6. **Profiles**: TOML files in `soundsprofiles/`, load/save/switch while playing.
-7. **Recording**: tap the master bus and write a WAV in a non-real-time thread (also write MIDI).
+6. **Profiles** (postponed): TOML files in `soundsprofiles/`, load/save/switch while playing.
+7. ✅ **Recording** (`r`): master output → 24-bit WAV via a preallocated block queue and a writer thread,
+   plus the played MIDI as a type-0 .mid (1 tick = 1 ms). Files in `~/Music/OFFENBACK/`.
 8. **Bluetooth tuning**: PipeWire bluez5 latency settings, SBC-XQ, latency offset measurement.
 
 ## Latency budget

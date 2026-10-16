@@ -20,6 +20,7 @@ use crate::engine::{EngineCmd, Stats};
 use crate::instrument::{self, Instrument, Progress};
 use crate::midi::{self, MidiEvent};
 use crate::params::{ParamId, Params};
+use crate::recorder::{RecMsg, Recording};
 
 const SUSTAIN_CC: u8 = 64;
 /// Buffer sizes offered with `[` / `]`; past the end means "server default".
@@ -55,8 +56,9 @@ pub struct App {
     ports: Vec<String>,
     port_list: ListState,
     connection: Option<Connection>,
-    ui_tx: Sender<MidiEvent>,
-    ui_rx: Receiver<MidiEvent>,
+    /// Incoming MIDI with its arrival time, for display and recording.
+    ui_tx: Sender<(MidiEvent, Instant)>,
+    ui_rx: Receiver<(MidiEvent, Instant)>,
     engine_tx: Sender<EngineCmd>,
     engine_rx: Receiver<EngineCmd>,
     stats: Arc<Stats>,
@@ -86,6 +88,10 @@ pub struct App {
     matrix_scroll: usize,
     /// Where each matrix cell was last drawn, for mouse clicks.
     cell_rects: Vec<(usize, Rect)>,
+    recording: Option<Recording>,
+    /// Kept for a moment after stopping so the engine never holds the last sender: the
+    /// queue's memory must be freed here, not on the audio thread.
+    rec_keepalive: Option<(Sender<RecMsg>, Instant)>,
     held: [bool; 128],
     sustain: bool,
     status: String,
@@ -130,6 +136,8 @@ impl App {
             selected: 0,
             matrix_scroll: 0,
             cell_rects: Vec::new(),
+            recording: None,
+            rec_keepalive: None,
             held: [false; 128],
             sustain: false,
             status: String::new(),
@@ -150,7 +158,7 @@ impl App {
         let result = midi::connect(query, move |event| {
             let at = Instant::now();
             let _ = engine_tx.try_send(EngineCmd::Midi { event, at });
-            let _ = ui_tx.try_send(event);
+            let _ = ui_tx.try_send((event, at));
         });
         match result {
             Ok((name, conn)) => {
@@ -181,6 +189,9 @@ impl App {
                 self.params_sent = Some(self.params);
             }
             while self.garbage_rx.try_recv().is_ok() {}
+            if self.rec_keepalive.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(1)) {
+                self.rec_keepalive = None;
+            }
             if self.test_note_off.is_some_and(|t| Instant::now() >= t) {
                 self.test_note_off = None;
                 self.send_engine(MidiEvent::NoteOff { ch: 0, note: TEST_NOTE, vel: 0 });
@@ -200,7 +211,49 @@ impl App {
                 }
             }
         }
+        if self.recording.is_some() {
+            self.toggle_recording();
+        }
         Ok(())
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.audio.as_ref().map_or(48_000, |a| a.sample_rate)
+    }
+
+    fn toggle_recording(&mut self) {
+        match self.recording.take() {
+            None => {
+                let Some(home) = std::env::var_os("HOME") else { return };
+                match Recording::start(&Path::new(&home).join("Music/OFFENBACK"), self.sample_rate()) {
+                    Ok(rec) => {
+                        self.stats.rec_dropped.store(0, std::sync::atomic::Ordering::Relaxed);
+                        let _ = self.engine_tx.try_send(EngineCmd::Record(Some(rec.sender())));
+                        self.status = format!("recording to {}", rec.wav_path.display());
+                        self.recording = Some(rec);
+                    }
+                    Err(e) => self.status = format!("cannot record: {e:#}"),
+                }
+            }
+            Some(rec) => {
+                // Tell the engine first; anything it still sends after Stop is ignored.
+                let _ = self.engine_tx.send(EngineCmd::Record(None));
+                self.rec_keepalive = Some((rec.sender(), Instant::now()));
+                let dropped = self.stats.rec_dropped.load(std::sync::atomic::Ordering::Relaxed);
+                self.status = match rec.stop(self.sample_rate()) {
+                    Ok(saved) => {
+                        let warn = if dropped > 0 { format!(" ({dropped} blocks lost: disk too slow)") } else { String::new() };
+                        format!(
+                            "saved {} ({:.1} s, {} notes) + .mid{warn}",
+                            saved.wav_path.display(),
+                            saved.seconds,
+                            saved.notes
+                        )
+                    }
+                    Err(e) => format!("recording failed: {e:#}"),
+                };
+            }
+        }
     }
 
     fn load_instrument(&mut self, path: PathBuf) {
@@ -255,6 +308,10 @@ impl App {
         match result {
             Ok(out) => {
                 self.params_sent = None;
+                // A new engine starts without the recorder.
+                if let Some(rec) = &self.recording {
+                    let _ = self.engine_tx.try_send(EngineCmd::Record(Some(rec.sender())));
+                }
                 self.audio_error = None;
                 self.status = format!("audio → {}", out.device_name);
                 self.audio = Some(out);
@@ -316,7 +373,10 @@ impl App {
     }
 
     fn drain_events(&mut self) {
-        for event in self.ui_rx.try_iter() {
+        for (event, at) in self.ui_rx.try_iter() {
+            if let Some(rec) = self.recording.as_mut() {
+                rec.midi(event, at);
+            }
             match event {
                 MidiEvent::NoteOn { note, .. } => self.held[note as usize] = true,
                 MidiEvent::NoteOff { note, .. } => self.held[note as usize] = false,
@@ -346,6 +406,7 @@ impl App {
             KeyCode::Char('o') => self.open_popup(Popup::Output),
             KeyCode::Char('p') => self.open_popup(Popup::Port),
             KeyCode::Char('i') => self.open_popup(Popup::Instrument),
+            KeyCode::Char('r' | 'R') => self.toggle_recording(),
             KeyCode::Left => self.selected = self.selected.saturating_sub(1),
             KeyCode::Right => self.selected = (self.selected + 1).min(count - 1),
             KeyCode::Up => self.selected = self.selected.saturating_sub(MATRIX_COLS),

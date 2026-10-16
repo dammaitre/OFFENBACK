@@ -35,6 +35,23 @@ impl MidiEvent {
     }
 }
 
+impl MidiEvent {
+    /// Raw MIDI bytes (and how many are used), for writing MIDI files.
+    pub fn to_bytes(&self) -> Option<([u8; 3], usize)> {
+        Some(match *self {
+            Self::NoteOn { ch, note, vel } => ([0x90 | ch, note, vel], 3),
+            Self::NoteOff { ch, note, vel } => ([0x80 | ch, note, vel], 3),
+            Self::ControlChange { ch, cc, value } => ([0xB0 | ch, cc, value], 3),
+            Self::ProgramChange { ch, program } => ([0xC0 | ch, program, 0], 2),
+            Self::PitchBend { ch, value } => {
+                let v = (value as i32 + 8192).clamp(0, 16383) as u16;
+                ([0xE0 | ch, (v & 0x7F) as u8, (v >> 7) as u8], 3)
+            }
+            Self::Other { .. } => return None,
+        })
+    }
+}
+
 pub fn list_ports() -> Result<Vec<String>> {
     let input = MidiInput::new(CLIENT_NAME).context("cannot open the ALSA sequencer")?;
     Ok(input

@@ -52,8 +52,16 @@ impl App {
             "   Output ".dim(),
             Span::raw(output).bold(),
         ]);
-        let right = Line::from(vec!["Sustain ".dim(), light(self.sustain), Span::raw(" ")]).alignment(Alignment::Right);
-        let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(11)]).areas(area);
+        let mut right = vec![];
+        if let Some(rec) = &self.recording {
+            let t = rec.elapsed().as_secs();
+            // Blink the dot once per second.
+            let dot = if rec.elapsed().subsec_millis() < 500 { "●" } else { " " };
+            right.push(Span::styled(format!("{dot} REC {}:{:02}   ", t / 60, t % 60), Style::new().fg(Color::LightRed).bold()));
+        }
+        right.extend(["Sustain ".dim(), light(self.sustain), Span::raw(" ")]);
+        let right = Line::from(right).alignment(Alignment::Right);
+        let [l, r] = Layout::horizontal([Constraint::Min(0), Constraint::Length(26)]).areas(area);
         f.render_widget(left, l);
         f.render_widget(right, r);
     }
@@ -172,7 +180,8 @@ impl App {
         let key = |k: &'static str, label: &'static str| {
             [Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(ACCENT)), Span::raw(format!(" {label}  "))]
         };
-        let mut spans: Vec<Span> = [key("o", "Output"), key("p", "Port"), key("i", "Instrument"), key("q", "Quit")]
+        let record = if self.recording.is_some() { "Stop rec" } else { "Record" };
+        let mut spans: Vec<Span> = [key("o", "Output"), key("p", "Port"), key("i", "Instrument"), key("r", record), key("q", "Quit")]
             .into_iter()
             .flatten()
             .collect();
