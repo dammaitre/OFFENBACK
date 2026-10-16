@@ -3,8 +3,9 @@
 ## Decisions
 - **Language**: Rust. Crates: `midir` (ALSA MIDI in), `cpal` (audio out via PipeWire's ALSA layer),
   `ratatui` + `crossterm` (TUI), `ogg` + `opus` (sample decoding), `serde` + `toml` (profiles), `hound` (WAV recording).
-- **Engine**: our own sampler, fed by Opus samples read from Muse Sounds `.sts` containers
-  (personal use; the samples are read in place from `~/Muse Sounds`, never redistributed).
+- **Engine**: our own sampler playing **SFZ** instruments (open format). Libraries live in `~/Sounds/SFZ/`:
+  Splendid Grand Piano (Akai Steinway, public domain) and Salamander Grand Piano V3
+  (Yamaha C5 by Alexander Holm, CC-BY 3.0). Muse Sounds `.sts` could become a second importer later.
 - **Outputs**: JBL Flip 5 (Bluetooth, SBC only) and OneOdio A70 (Bluetooth SBC, or wired jack).
 - **v1 extra feature**: recording.
 
@@ -30,7 +31,9 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 ## Milestones
 1. ✅ **Skeleton**: cargo project, choose a MIDI port in the TUI, live event log (test with `fake_keyboard`).
 2. ✅ **Audio out**: pick output device, sine-synth voices, measure latency on wired output, buffer size setting.
-3. **.sts reader + sampler**: parse the container, decode Opus to f32 in RAM, map the Piano, velocity layers, release envelope.
+3. ✅ **SFZ sampler**: SFZ parser (defines/includes/inheritance/curves), CC-modulated params, FLAC/WAV decoded to
+   normalized i16 in RAM, Hermite interpolation, DAHDSR, filters, polyphony groups, release triggers, keyswitches,
+   CC-triggered regions. Splendid: 245 MB, 0.6 s load. Salamander: 1.25 GB, 3.3 s load.
 4. **Transform stage**: velocity curve (editable points), auto-sustain, CC64 passthrough, transpose, detune.
 5. **FX**: low-pass/cutoff, reverb, master gain + limiter.
 6. **Profiles**: TOML files in `soundsprofiles/`, load/save/switch while playing.

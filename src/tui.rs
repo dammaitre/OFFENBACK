@@ -1,8 +1,10 @@
 //! Terminal UI: MIDI port picker, audio output picker and live monitor.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -17,6 +19,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::audio::{self, AudioOut, OutputInfo};
 use crate::engine::{EngineCmd, Stats};
+use crate::instrument::{self, Instrument, Progress};
 use crate::midi::{self, MidiEvent, TimedEvent, note_name};
 
 const LOG_CAPACITY: usize = 500;
@@ -39,6 +42,12 @@ struct Connection {
     _conn: MidiInputConnection<()>,
 }
 
+struct Loading {
+    name: String,
+    progress: Arc<Progress>,
+    handle: JoinHandle<Result<Instrument>>,
+}
+
 pub struct App {
     screen: Screen,
     /// Where the output picker returns to.
@@ -51,6 +60,11 @@ pub struct App {
     engine_tx: Sender<EngineCmd>,
     engine_rx: Receiver<EngineCmd>,
     stats: Arc<Stats>,
+    instrument: Arc<Instrument>,
+    loading: Option<Loading>,
+    /// Instruments the audio thread no longer uses; dropped here, off the real-time thread.
+    garbage_tx: Sender<Arc<Instrument>>,
+    garbage_rx: Receiver<Arc<Instrument>>,
     audio: Option<AudioOut>,
     audio_error: Option<String>,
     outputs: Vec<OutputInfo>,
@@ -69,9 +83,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(output: Option<String>, buffer: Option<u32>) -> Self {
+    pub fn new(output: Option<String>, buffer: Option<u32>, instrument: Option<PathBuf>) -> Self {
         let (ui_tx, ui_rx) = crossbeam_channel::bounded(4096);
         let (engine_tx, engine_rx) = crossbeam_channel::bounded(1024);
+        let (garbage_tx, garbage_rx) = crossbeam_channel::bounded(8);
         // The server default is often 1024 frames (~43 ms on built-in speakers); ask for less.
         let buffer = Some(buffer.unwrap_or(DEFAULT_BUFFER)).map(|b| {
             BUFFER_SIZES.iter().position(|&s| s >= b).unwrap_or(BUFFER_SIZES.len() - 1)
@@ -87,6 +102,10 @@ impl App {
             engine_tx,
             engine_rx,
             stats: Arc::new(Stats::default()),
+            instrument: Arc::new(Instrument::builtin_sine(48_000)),
+            loading: None,
+            garbage_tx,
+            garbage_rx,
             audio: None,
             audio_error: None,
             outputs: Vec::new(),
@@ -103,7 +122,40 @@ impl App {
         };
         app.refresh_ports();
         app.open_audio();
+        if let Some(path) = instrument {
+            app.load_instrument(path);
+        }
         app
+    }
+
+    fn load_instrument(&mut self, path: PathBuf) {
+        let progress = Arc::new(Progress::default());
+        let name = path.file_stem().map_or("instrument".into(), |s| s.to_string_lossy().into_owned());
+        let p = progress.clone();
+        let handle = std::thread::spawn(move || instrument::load_sfz(&path, &p));
+        self.status = format!("loading {name}…");
+        self.loading = Some(Loading { name, progress, handle });
+    }
+
+    fn poll_loading(&mut self) {
+        if !self.loading.as_ref().is_some_and(|l| l.handle.is_finished()) {
+            return;
+        }
+        let Some(loading) = self.loading.take() else { return };
+        match loading.handle.join() {
+            Ok(Ok(inst)) => {
+                self.status = format!(
+                    "{} loaded: {} regions, {} MB",
+                    inst.name,
+                    inst.regions.len(),
+                    inst.memory_bytes() >> 20
+                );
+                self.instrument = Arc::new(inst);
+                let _ = self.engine_tx.try_send(EngineCmd::SetInstrument(self.instrument.clone()));
+            }
+            Ok(Err(e)) => self.status = format!("cannot load {}: {e:#}", loading.name),
+            Err(_) => self.status = format!("loading {} crashed", loading.name),
+        }
     }
 
     /// Connects straight away, skipping the picker.
@@ -129,6 +181,8 @@ impl App {
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             self.drain_events();
+            self.poll_loading();
+            while self.garbage_rx.try_recv().is_ok() {}
             if self.test_note_off.is_some_and(|t| Instant::now() >= t) {
                 self.test_note_off = None;
                 self.send_engine(MidiEvent::NoteOff { ch: 0, note: TEST_NOTE, vel: 0 });
@@ -155,7 +209,15 @@ impl App {
         while self.engine_rx.try_recv().is_ok() {}
         self.stats.reset_latency();
         let buffer = self.buffer_frames();
-        match audio::open(self.output.as_deref(), buffer, self.engine_rx.clone(), self.stats.clone()) {
+        let result = audio::open(
+            self.output.as_deref(),
+            buffer,
+            self.instrument.clone(),
+            self.engine_rx.clone(),
+            self.garbage_tx.clone(),
+            self.stats.clone(),
+        );
+        match result {
             Ok(out) => {
                 self.audio_error = None;
                 self.status = format!("audio → {}", out.device_name);
@@ -282,7 +344,7 @@ impl App {
         let [title, body, audio_area, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(1),
         ])
         .areas(f.area());
@@ -386,7 +448,41 @@ impl App {
         let meter_color = if peak > 0.9 { Color::Red } else { Color::Green };
         let errors = s.errors.load(Relaxed);
 
+        let instrument_line = match &self.loading {
+            Some(l) => {
+                let (done, total) = (l.progress.done.load(Relaxed), l.progress.total.load(Relaxed).max(1));
+                let filled = done * 20 / total;
+                Line::from(vec![
+                    "Instrument ".dim(),
+                    Span::raw(format!("loading {} ", l.name)),
+                    Span::raw(format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled))).cyan(),
+                    Span::raw(format!(" {done}/{total} samples")).dim(),
+                ])
+            }
+            None => {
+                let inst = &self.instrument;
+                let mut spans = vec![
+                    "Instrument ".dim(),
+                    Span::raw(inst.name.clone()).bold(),
+                    format!(
+                        "   {} regions · {} samples · {} MB",
+                        inst.regions.len(),
+                        inst.samples.len(),
+                        inst.memory_bytes() >> 20
+                    )
+                    .dim(),
+                ];
+                if !inst.unsupported.is_empty() {
+                    spans.push(format!("   ignored: {}", inst.unsupported.join(" ")).dark_gray());
+                }
+                if !inst.warnings.is_empty() {
+                    spans.push(format!("   {} sample(s) failed", inst.warnings.len()).red());
+                }
+                Line::from(spans)
+            }
+        };
         let lines = vec![
+            instrument_line,
             Line::from(vec![
                 "Output ".dim(),
                 Span::raw(out.device_name.clone()).bold(),
