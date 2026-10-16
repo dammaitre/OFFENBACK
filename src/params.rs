@@ -18,29 +18,45 @@ pub enum ParamId {
     Velocity,
     Resonance,
     Lfo,
+    LfoRate,
+    FilterEnv,
+    Glide,
 }
 
 impl ParamId {
-    /// Matrix order, 5 per row: level & pitch, synth envelope & LFO, filters.
-    pub const ALL: [ParamId; 13] = [
+    /// Matrix order, 6 per row: level & pitch, synth envelope & LFO, filters.
+    pub const ALL: [ParamId; 16] = [
         ParamId::Volume,
         ParamId::Transpose,
         ParamId::Detune,
         ParamId::Velocity,
         ParamId::Reverb,
+        ParamId::Glide,
         ParamId::Attack,
         ParamId::Decay,
         ParamId::Sustain,
         ParamId::Release,
         ParamId::Lfo,
+        ParamId::LfoRate,
         ParamId::LowPass,
         ParamId::Resonance,
+        ParamId::FilterEnv,
         ParamId::HighPass,
     ];
 
     /// Only meaningful for synths: a recorded piano has its own envelope.
     pub fn synth_only(self) -> bool {
-        matches!(self, ParamId::Attack | ParamId::Decay | ParamId::Sustain | ParamId::Release | ParamId::Lfo)
+        matches!(
+            self,
+            ParamId::Attack
+                | ParamId::Decay
+                | ParamId::Sustain
+                | ParamId::Release
+                | ParamId::Lfo
+                | ParamId::LfoRate
+                | ParamId::FilterEnv
+                | ParamId::Glide
+        )
     }
 
     pub fn spec(self) -> &'static Spec {
@@ -70,7 +86,7 @@ pub struct Spec {
     default_label: Option<&'static str>,
 }
 
-const SPECS: [Spec; 13] = [
+const SPECS: [Spec; 16] = [
     Spec {
         name: "Volume",
         min: -48.0,
@@ -201,10 +217,37 @@ const SPECS: [Spec; 13] = [
         format: |v| format!("±{v:.0} ct"),
         default_label: Some("off"),
     },
+    Spec {
+        name: "LFO rate",
+        min: 0.1,
+        max: 20.0,
+        default: 5.5,
+        scale: Scale::Log,
+        steps: 100,
+        format: |v| if v < 1.0 { format!("{v:.2} Hz") } else { format!("{v:.1} Hz") },
+        default_label: None,
+    },
+    Spec {
+        name: "Filter env",
+        min: 0.0,
+        max: 8.0,
+        default: 0.0,
+        scale: Scale::Linear,
+        steps: 64,
+        format: |v| format!("+{v:.2} oct"),
+        default_label: Some("off"),
+    },
+    Spec {
+        name: "Glide",
+        min: 0.0,
+        max: 2.0,
+        default: 0.0,
+        scale: Scale::Square,
+        steps: 100,
+        format: format_seconds,
+        default_label: Some("off"),
+    },
 ];
-
-/// Vibrato rate of the LFO cell.
-pub const LFO_RATE_HZ: f32 = 5.5;
 
 fn format_seconds(v: f32) -> String {
     if v < 1.0 { format!("{:.0} ms", v * 1000.0) } else { format!("{v:.2} s") }
@@ -320,6 +363,10 @@ mod tests {
         assert_eq!(ParamId::Release.spec().format(0.3), "300 ms");
         assert_eq!(ParamId::Attack.spec().format(2.5), "2.50 s");
         assert_eq!(ParamId::Lfo.spec().format(0.0), "off");
+        assert_eq!(ParamId::LfoRate.spec().format(5.5), "5.5 Hz");
+        assert_eq!(ParamId::FilterEnv.spec().format(3.0), "+3.00 oct");
+        assert_eq!(ParamId::Glide.spec().format(0.0), "off");
+        assert!(ParamId::Glide.synth_only() && ParamId::FilterEnv.synth_only());
         assert!(ParamId::Sustain.synth_only() && !ParamId::Resonance.synth_only());
     }
 }

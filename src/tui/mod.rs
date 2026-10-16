@@ -30,7 +30,7 @@ const DEFAULT_BUFFER: u32 = 128;
 const TEST_NOTE: u8 = 60;
 const TEST_NOTE_LENGTH: Duration = Duration::from_millis(600);
 /// Matrix shape: parameters are laid out row by row.
-const MATRIX_COLS: usize = 5;
+const MATRIX_COLS: usize = 6;
 /// Steps per PgUp/PgDn.
 const COARSE_STEPS: i32 = 10;
 

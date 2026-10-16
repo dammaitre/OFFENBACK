@@ -50,7 +50,8 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 7b. ✅ **Synths**: live oscillator voices (Sine, Triangle, Saw, Square, Pulse 25 %, Super saw 7×) with PolyBLEP
    anti-aliasing, chosen in the Instrument window next to the SFZ pianos. Attack/Decay/Sustain/Release are a
    classic synth ADSR and greyed out for sampled instruments; LFO = vibrato (5.5 Hz); Resonance on the master
-   low-pass for every instrument.
+   low-pass for every instrument. Filter env (+0..8 oct, per-voice LP on synths), Glide (legato portamento,
+   chords excluded), LFO rate (0.1-20 Hz). Matrix is 3 rows of 6.
 8. **Bluetooth tuning**: PipeWire bluez5 latency settings, SBC-XQ, latency offset measurement.
 
 ## Latency budget

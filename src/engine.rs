@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::instrument::{CC_COUNT, Ctx, FilterKind, Instrument, Region, Trigger};
 use crate::midi::MidiEvent;
-use crate::params::{LFO_RATE_HZ, ParamId, Params, velocity_gamma};
+use crate::params::{ParamId, Params, velocity_gamma};
 use crate::recorder::{AudioBlock, BLOCK_FRAMES, RecMsg};
 use crate::reverb::Reverb;
 use crate::synth::{MAX_UNISON, oscillator};
@@ -32,6 +32,10 @@ const TAIL_FADE_S: f32 = 0.25;
 /// Master filters at these cutoffs are bypassed.
 const LOW_PASS_OFF_HZ: f32 = 19_900.0;
 const HIGH_PASS_OFF_HZ: f32 = 20.5;
+/// Synth voice filters are recomputed this often (frames) while their envelope moves.
+const FILTER_UPDATE_FRAMES: usize = 32;
+/// Notes starting this close together are a chord: they don't glide from one another.
+const GLIDE_CHORD_S: f32 = 0.03;
 
 pub enum EngineCmd {
     /// `at` is when the event reached us, for latency measurement.
@@ -53,8 +57,13 @@ struct User {
     decay: f32,
     sustain: f32,
     release: f32,
-    /// Synth vibrato depth.
+    /// Synth vibrato depth and speed.
     lfo_cents: f32,
+    lfo_rate: f32,
+    /// Octaves the synth filter opens at each note's attack.
+    filter_env_oct: f32,
+    /// Synth portamento time (0 = off).
+    glide: f32,
     low_pass_hz: f32,
     resonance_db: f32,
     high_pass_hz: f32,
@@ -74,6 +83,9 @@ impl User {
             sustain: p.get(ParamId::Sustain) / 100.0,
             release: p.get(ParamId::Release),
             lfo_cents: p.get(ParamId::Lfo),
+            lfo_rate: p.get(ParamId::LfoRate),
+            filter_env_oct: p.get(ParamId::FilterEnv),
+            glide: p.get(ParamId::Glide),
             low_pass_hz: p.get(ParamId::LowPass),
             resonance_db: p.get(ParamId::Resonance),
             high_pass_hz: p.get(ParamId::HighPass),
@@ -156,6 +168,18 @@ struct Env {
 }
 
 impl Env {
+    const IDLE: Self = Self {
+        stage: Stage::Done,
+        level: 0.0,
+        delay_left: 0,
+        hold_left: 0,
+        attack_step: 0.0,
+        decay_coef: 0.0,
+        sustain: 0.0,
+        release_coef: 0.0,
+        release_after_attack: false,
+    };
+
     fn new(delay: f32, attack: f32, hold: f32, decay: f32, sustain_pct: f32, sr: f32) -> Self {
         let delay_left = (delay.max(0.0) * sr) as u32;
         Self {
@@ -314,6 +338,11 @@ struct Voice {
     /// Synth voice: `step` is the base phase increment and `phases` the oscillators.
     synth: bool,
     phases: [f32; MAX_UNISON],
+    /// Synth filter envelope (same attack/decay as the amplitude, falls back to 0).
+    fenv: Env,
+    /// Glide: current pitch / target pitch, easing to 1.
+    glide_ratio: f32,
+    glide_coef: f32,
     /// Position where the end-of-sample fade starts, and 1 / its length.
     tail_start: f64,
     tail_inv: f32,
@@ -338,19 +367,12 @@ impl Voice {
         pos: 0.0,
         step: 0.0,
         gain: [0.0; 2],
-        env: Env {
-            stage: Stage::Done,
-            level: 0.0,
-            delay_left: 0,
-            hold_left: 0,
-            attack_step: 0.0,
-            decay_coef: 0.0,
-            sustain: 0.0,
-            release_coef: 0.0,
-            release_after_attack: false,
-        },
+        env: Env::IDLE,
         synth: false,
         phases: [0.0; MAX_UNISON],
+        fenv: Env::IDLE,
+        glide_ratio: 1.0,
+        glide_coef: 0.0,
         tail_start: 0.0,
         tail_inv: 0.0,
         filter: None,
@@ -370,6 +392,8 @@ pub struct Engine {
     user: User,
     /// Free-running vibrato phase (0..1).
     lfo_phase: f32,
+    /// Pitch (phase increment) and start time of the last synth note, for glide.
+    last_synth_note: Option<(f64, u64)>,
     /// Smoothed master gain.
     gain: f32,
     gain_step: f32,
@@ -420,6 +444,7 @@ impl Engine {
             bend: 1.0,
             user: User::new(&Params::default()),
             lfo_phase: 0.0,
+            last_synth_note: None,
             gain: 1.0,
             gain_step: 1.0 - (-1.0 / (0.01 * sr)).exp(),
             low_pass: Biquad::new(FilterKind::Lpf2p, 20_000.0, 0.0, sr),
@@ -771,6 +796,9 @@ impl Engine {
             env,
             synth: false,
             phases: [0.0; MAX_UNISON],
+            fenv: Env::IDLE,
+            glide_ratio: 1.0,
+            glide_coef: 0.0,
             tail_start: (sample.frames - tail_len) as f64,
             tail_inv: 1.0 / tail_len as f32,
             filter,
@@ -806,17 +834,33 @@ impl Engine {
             }
         }
         let u = self.user;
+        let step = freq / self.sr as f64;
+        // Legato glide: slide from the previous note if a key is still down and it wasn't
+        // struck together with this one (a chord).
+        let chord_frames = (GLIDE_CHORD_S * self.sr) as u64;
+        let legato = self.voices.iter().any(|v| v.active && v.synth && v.key_down);
+        let glide_from = match self.last_synth_note {
+            Some((prev, at)) if u.glide > 0.0 && legato && self.clock.saturating_sub(at) > chord_frames => {
+                (prev / step) as f32
+            }
+            _ => 1.0,
+        };
+        self.last_synth_note = Some((step, self.clock));
         let gain = patch.unison_gain() * (vel as f32 / 127.0).powi(2);
         self.voice_counter += 1;
         self.place_voice(Voice {
             active: true,
             note,
             vel,
-            step: freq / self.sr as f64,
+            step,
             gain: [gain; 2],
             env: Env::new(0.0, u.attack, 0.0, u.decay, u.sustain * 100.0, self.sr),
             synth: true,
             phases,
+            fenv: Env::new(0.0, u.attack, 0.0, u.decay, 0.0, self.sr),
+            glide_ratio: glide_from,
+            glide_coef: exp_coef(u.glide, self.sr),
+            filter: Some(Biquad::new(FilterKind::Lpf2p, 20_000.0, 0.0, self.sr)),
             key_down: true,
             started: self.voice_counter,
             ..Voice::IDLE
@@ -830,7 +874,7 @@ impl Engine {
         let inst = &*self.inst;
         let bend = (self.bend * self.user.detune) as f64;
         // Vibrato for synth voices, updated once per block.
-        self.lfo_phase = (self.lfo_phase + out.len() as f32 * LFO_RATE_HZ / self.sr).fract();
+        self.lfo_phase = (self.lfo_phase + out.len() as f32 * self.user.lfo_rate / self.sr).fract();
         let vibrato = 2f64.powf((self.user.lfo_cents * (self.lfo_phase * std::f32::consts::TAU).sin()) as f64 / 1200.0);
         // Unison layout of the current synth patch: pitch ratio and L/R gains per oscillator.
         let mut unison = [(1.0f64, 1.0f32, 1.0f32); MAX_UNISON];
@@ -844,16 +888,28 @@ impl Engine {
             }
             None => (crate::synth::Waveform::Sine, 0),
         };
+        // Synths filter each voice (so the filter envelope can sweep it); pianos use the
+        // master low-pass below.
+        let filter_on = inst.synth.is_some() && self.low_pass_hz < LOW_PASS_OFF_HZ;
         let mut active = 0;
         for v in self.voices.iter_mut().filter(|v| v.active) {
             if v.synth {
                 let step = v.step * bend * vibrato;
-                for frame in out.iter_mut() {
+                for (n, frame) in out.iter_mut().enumerate() {
                     let e = v.env.next();
                     if v.env.stage == Stage::Done {
                         v.active = false;
                         break;
                     }
+                    let fe = v.fenv.next();
+                    if filter_on && n % FILTER_UPDATE_FRAMES == 0 {
+                        let cutoff = self.low_pass_hz * 2f32.powf(self.user.filter_env_oct * fe);
+                        if let Some(f) = v.filter.as_mut() {
+                            f.set(FilterKind::Lpf2p, cutoff, self.low_pass_res, self.sr);
+                        }
+                    }
+                    v.glide_ratio = 1.0 + (v.glide_ratio - 1.0) * v.glide_coef;
+                    let step = step * v.glide_ratio as f64;
                     let (mut l, mut r) = (0.0, 0.0);
                     for k in 0..oscillators {
                         let (ratio, gl, gr) = unison[k];
@@ -865,6 +921,12 @@ impl Engine {
                         }
                         l += x * gl;
                         r += x * gr;
+                    }
+                    if filter_on {
+                        if let Some(f) = v.filter.as_mut() {
+                            l = f.process(0, l);
+                            r = f.process(1, r);
+                        }
                     }
                     frame[0] += l * v.gain[0] * e;
                     frame[1] += r * v.gain[1] * e;
@@ -913,7 +975,7 @@ impl Engine {
             }
         }
 
-        let lp_on = self.low_pass_hz < LOW_PASS_OFF_HZ;
+        let lp_on = self.inst.synth.is_none() && self.low_pass_hz < LOW_PASS_OFF_HZ;
         let hp_on = self.high_pass_hz > HIGH_PASS_OFF_HZ;
         let reverb_wanted = self.user.reverb > 0.0;
         if reverb_wanted {
@@ -1452,6 +1514,60 @@ mod tests {
             }
             rig.send(cc(ALL_NOTES_OFF_CC, 0));
         }
+    }
+
+    /// High-frequency share of the left channel: RMS of the sample-to-sample difference over RMS.
+    fn brightness(buf: &[[f32; 2]]) -> f32 {
+        let d: f32 = buf.windows(2).map(|w| (w[1][0] - w[0][0]).powi(2)).sum::<f32>();
+        let x: f32 = buf.iter().map(|f| f[0] * f[0]).sum::<f32>();
+        (d / x.max(1e-12)).sqrt()
+    }
+
+    #[test]
+    fn filter_envelope_opens_then_closes() {
+        let mut rig = Rig::new(synth("Saw"));
+        // Low pass ~600 Hz, envelope +4 octaves, decay 0.4 s (default).
+        rig.set(&[(ParamId::LowPass, -84), (ParamId::FilterEnv, 32), (ParamId::Attack, -100)]);
+        rig.run(0.1); // let the master cutoff glide settle
+        rig.send(on(45, 127)); // 110 Hz
+        rig.engine.render(&mut rig.buf);
+        let early = brightness(&rig.buf);
+        rig.run(2.0);
+        rig.engine.render(&mut rig.buf);
+        let late = brightness(&rig.buf);
+        assert!(early > late * 2.0, "bright attack ({early}) closing to the base cutoff ({late})");
+    }
+
+    #[test]
+    fn glide_slides_legato_notes_but_not_chords() {
+        let mut rig = Rig::new(synth("Sine"));
+        rig.set(&[(ParamId::Glide, 50)]); // 0.5 s
+        rig.send(on(57, 100));
+        rig.run(0.1);
+        rig.send(on(69, 100)); // legato: 57 still held
+        let v = *rig.engine.voices.iter().filter(|v| v.active).max_by_key(|v| v.started).unwrap();
+        assert!((v.glide_ratio - 0.5).abs() < 1e-3, "starts an octave below: {}", v.glide_ratio);
+        rig.run(0.6);
+        let v = *rig.engine.voices.iter().filter(|v| v.active).max_by_key(|v| v.started).unwrap();
+        assert!((v.glide_ratio - 1.0).abs() < 0.01, "arrived: {}", v.glide_ratio);
+
+        // A chord struck at once: no glide between its notes.
+        let mut rig = Rig::new(synth("Sine"));
+        rig.set(&[(ParamId::Glide, 50)]);
+        rig.send(on(60, 100));
+        rig.send(on(64, 100));
+        rig.send(on(67, 100));
+        assert!(rig.engine.voices.iter().filter(|v| v.active).all(|v| v.glide_ratio == 1.0));
+    }
+
+    #[test]
+    fn lfo_rate_sets_vibrato_speed() {
+        let mut rig = Rig::new(synth("Sine"));
+        rig.set(&[(ParamId::LfoRate, 100)]); // 20 Hz
+        let before = rig.engine.lfo_phase;
+        rig.run(0.5); // 94 blocks of 256 = 0.5013 s → 10.03 cycles
+        let cycles = (rig.engine.lfo_phase - before).rem_euclid(1.0);
+        assert!((cycles - 0.0267).abs() < 0.01, "fractional cycles {cycles}");
     }
 
     #[test]
