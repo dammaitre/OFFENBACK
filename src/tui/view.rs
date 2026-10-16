@@ -125,12 +125,17 @@ impl App {
         let spec = id.spec();
         let value = self.params.get(id);
         let changed = !self.params.is_default(id);
+        let enabled = self.is_enabled(id);
         let border = if selected {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(Color::DarkGray)
         };
-        let name = if selected { spec.name.bold().fg(ACCENT) } else { Span::raw(spec.name) };
+        let name = match (selected, enabled) {
+            (true, _) => spec.name.bold().fg(ACCENT),
+            (false, true) => Span::raw(spec.name),
+            (false, false) => spec.name.dark_gray(),
+        };
         let block = Block::bordered()
             .border_type(if selected { BorderType::Thick } else { BorderType::Rounded })
             .border_style(border)
@@ -138,13 +143,22 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let value_style = if changed { Style::new().fg(Color::Yellow).bold() } else { Style::new().bold() };
         let gauge_w = inner.width.saturating_sub(2) as usize;
-        let lines = vec![
-            Line::styled(spec.format(value), value_style).centered(),
-            Line::raw(""),
-            gauge(gauge_w, spec.to_norm(spec.default), spec.to_norm(value), selected).centered(),
-        ];
+        let lines = if enabled {
+            let value_style = if changed { Style::new().fg(Color::Yellow).bold() } else { Style::new().bold() };
+            vec![
+                Line::styled(spec.format(value), value_style).centered(),
+                Line::raw(""),
+                gauge(gauge_w, spec.to_norm(spec.default), spec.to_norm(value), selected).centered(),
+            ]
+        } else {
+            // Greyed out: the instrument's own recording decides this.
+            vec![
+                Line::styled(spec.format(value), Style::new().fg(Color::DarkGray)).centered(),
+                Line::styled("synth only", Style::new().fg(Color::DarkGray).italic()).centered(),
+                Line::styled("─".repeat(gauge_w), Style::new().fg(Color::DarkGray)).centered(),
+            ]
+        };
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -205,7 +219,7 @@ impl App {
         let (title, keys) = match popup {
             Popup::Port => (" MIDI input ", " ↑↓ select  ⏎ connect  r refresh  esc close "),
             Popup::Output => (" Audio output ", " ⏎ use  [ ] buffer  t test  l reset worst  esc close "),
-            Popup::Instrument => (" Instrument (~/Sounds/SFZ) ", " ↑↓ select  ⏎ load  r refresh  esc close "),
+            Popup::Instrument => (" Instrument ", " ↑↓ select  ⏎ load  r refresh  esc close "),
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -233,14 +247,19 @@ impl App {
                 (items, &mut self.output_list, "No audio output found. Press r to refresh.")
             }
             Popup::Instrument => {
-                let current = self.instrument_path.as_ref();
+                let current = self.instrument_source.as_ref();
                 let home = std::env::var("HOME").unwrap_or_default();
                 let items = self
                     .instruments
                     .iter()
-                    .map(|p| {
-                        let shown = p.to_string_lossy().replacen(&format!("{home}/Sounds/SFZ/"), "", 1);
-                        item(shown, None, Some(p) == current)
+                    .map(|source| {
+                        let (shown, detail) = match source {
+                            super::Source::Synth(i) => (format!("Synth · {}", crate::synth::PRESETS[*i].name), "synth"),
+                            super::Source::Sfz(p) => {
+                                (p.to_string_lossy().replacen(&format!("{home}/Sounds/SFZ/"), "", 1), "~/Sounds/SFZ")
+                            }
+                        };
+                        item(shown, Some(detail.to_owned()), Some(source) == current)
                     })
                     .collect();
                 (items, &mut self.instrument_list, "No .sfz file found in ~/Sounds/SFZ.")

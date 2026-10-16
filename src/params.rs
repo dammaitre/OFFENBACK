@@ -16,23 +16,32 @@ pub enum ParamId {
     LowPass,
     HighPass,
     Velocity,
+    Resonance,
+    Lfo,
 }
 
 impl ParamId {
-    /// Matrix order, 4 per row: level & pitch, envelope, filters & touch.
-    pub const ALL: [ParamId; 11] = [
+    /// Matrix order, 5 per row: level & pitch, synth envelope & LFO, filters.
+    pub const ALL: [ParamId; 13] = [
         ParamId::Volume,
         ParamId::Transpose,
         ParamId::Detune,
+        ParamId::Velocity,
         ParamId::Reverb,
         ParamId::Attack,
         ParamId::Decay,
         ParamId::Sustain,
         ParamId::Release,
+        ParamId::Lfo,
         ParamId::LowPass,
+        ParamId::Resonance,
         ParamId::HighPass,
-        ParamId::Velocity,
     ];
+
+    /// Only meaningful for synths: a recorded piano has its own envelope.
+    pub fn synth_only(self) -> bool {
+        matches!(self, ParamId::Attack | ParamId::Decay | ParamId::Sustain | ParamId::Release | ParamId::Lfo)
+    }
 
     pub fn spec(self) -> &'static Spec {
         &SPECS[self as usize]
@@ -61,7 +70,7 @@ pub struct Spec {
     default_label: Option<&'static str>,
 }
 
-const SPECS: [Spec; 11] = [
+const SPECS: [Spec; 13] = [
     Spec {
         name: "Volume",
         min: -48.0,
@@ -75,45 +84,41 @@ const SPECS: [Spec; 11] = [
     Spec {
         name: "Attack",
         min: 0.0,
-        max: 2000.0,
-        default: 0.0,
+        max: 5.0,
+        default: 0.005,
         scale: Scale::Square,
         steps: 100,
-        format: |v| format!("+{v:.0} ms"),
-        default_label: Some("inst"),
+        format: format_seconds,
+        default_label: None,
     },
     Spec {
         name: "Decay",
-        min: 0.2,
-        max: 30.0,
-        default: 30.0,
+        min: 0.01,
+        max: 10.0,
+        default: 0.4,
         scale: Scale::Log,
         steps: 100,
-        format: |v| format!("{v:.1} s"),
-        default_label: Some("off"),
+        format: format_seconds,
+        default_label: None,
     },
     Spec {
         name: "Sustain",
         min: 0.0,
         max: 100.0,
-        default: 0.0,
+        default: 70.0,
         scale: Scale::Linear,
         steps: 100,
-        format: |v| match sustain_seconds(v) {
-            _ if v >= 100.0 => "pedal".into(),
-            Some(s) => format!("{s:.1} s"),
-            None => "off".into(),
-        },
-        default_label: Some("off"),
+        format: |v| format!("{v:.0} %"),
+        default_label: None,
     },
     Spec {
         name: "Release",
-        min: 0.1,
-        max: 5.0,
-        default: 1.0,
+        min: 0.01,
+        max: 10.0,
+        default: 0.3,
         scale: Scale::Log,
-        steps: 80,
-        format: |v| format!("×{v:.2}"),
+        steps: 100,
+        format: format_seconds,
         default_label: None,
     },
     Spec {
@@ -176,12 +181,33 @@ const SPECS: [Spec; 11] = [
         format: |v| if v > 0.0 { format!("light {v:.0}") } else { format!("heavy {:.0}", -v) },
         default_label: Some("linear"),
     },
+    Spec {
+        name: "Resonance",
+        min: 0.0,
+        max: 18.0,
+        default: 0.0,
+        scale: Scale::Linear,
+        steps: 72,
+        format: |v| format!("{v:.1} dB"),
+        default_label: Some("off"),
+    },
+    Spec {
+        name: "LFO",
+        min: 0.0,
+        max: 100.0,
+        default: 0.0,
+        scale: Scale::Square,
+        steps: 100,
+        format: |v| format!("±{v:.0} ct"),
+        default_label: Some("off"),
+    },
 ];
 
-/// Ring time after key release for a Sustain setting: 0 → none, 1..99 % → 0.2..20 s
-/// (equal ratios per step), 100 % → the pedal (handled by the engine, `None` here too).
-pub fn sustain_seconds(pct: f32) -> Option<f32> {
-    (pct > 0.0 && pct < 100.0).then(|| 0.2 * 100f32.powf((pct - 1.0) / 98.0))
+/// Vibrato rate of the LFO cell.
+pub const LFO_RATE_HZ: f32 = 5.5;
+
+fn format_seconds(v: f32) -> String {
+    if v < 1.0 { format!("{:.0} ms", v * 1000.0) } else { format!("{v:.2} s") }
 }
 
 /// Touch curve exponent for the Velocity parameter: light (+100) → 0.25, heavy (-100) → 4.
@@ -238,12 +264,15 @@ impl Params {
         self.values[id as usize]
     }
 
-    /// Moves `id` by `steps` notches (negative = down), snapping to the step grid.
+    /// Moves `id` by `steps` notches (negative = down). The grid is anchored on the default,
+    /// so stepping away and back always lands exactly on it, even when it's between grid
+    /// points of the raw range.
     pub fn nudge(&mut self, id: ParamId, steps: i32) {
         let spec = id.spec();
-        let n = (spec.to_norm(self.get(id)) * spec.steps as f32).round() as i32 + steps;
-        let n = n.clamp(0, spec.steps as i32) as f32 / spec.steps as f32;
-        self.values[id as usize] = spec.from_norm(n);
+        let (n_def, per) = (spec.to_norm(spec.default), spec.steps as f32);
+        let k = ((spec.to_norm(self.get(id)) - n_def) * per).round() as i32 + steps;
+        let n = (n_def + k as f32 / per).clamp(0.0, 1.0);
+        self.values[id as usize] = if k == 0 { spec.default } else { spec.from_norm(n) };
     }
 
     pub fn reset(&mut self, id: ParamId) {
@@ -288,10 +317,9 @@ mod tests {
         assert_eq!(ParamId::Volume.spec().format(p.get(ParamId::Volume)), "-0.5 dB");
         assert_eq!(ParamId::LowPass.spec().format(20_000.0), "off");
         assert_eq!(ParamId::LowPass.spec().format(1200.0), "1.2 kHz");
-        assert_eq!(ParamId::Release.spec().format(1.0), "×1.00");
-        assert_eq!(ParamId::Sustain.spec().format(0.0), "off");
-        assert_eq!(ParamId::Sustain.spec().format(1.0), "0.2 s");
-        assert_eq!(ParamId::Sustain.spec().format(99.0), "20.0 s");
-        assert_eq!(ParamId::Sustain.spec().format(100.0), "pedal");
+        assert_eq!(ParamId::Release.spec().format(0.3), "300 ms");
+        assert_eq!(ParamId::Attack.spec().format(2.5), "2.50 s");
+        assert_eq!(ParamId::Lfo.spec().format(0.0), "off");
+        assert!(ParamId::Sustain.synth_only() && !ParamId::Resonance.synth_only());
     }
 }

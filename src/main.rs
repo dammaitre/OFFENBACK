@@ -6,6 +6,7 @@ mod params;
 mod recorder;
 mod reverb;
 mod sfz;
+mod synth;
 mod tui;
 
 use std::path::PathBuf;

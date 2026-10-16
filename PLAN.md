@@ -47,6 +47,10 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 6. **Profiles** (postponed): TOML files in `soundsprofiles/`, load/save/switch while playing.
 7. ✅ **Recording** (`r`): master output → 24-bit WAV via a preallocated block queue and a writer thread,
    plus the played MIDI as a type-0 .mid (1 tick = 1 ms). Files in `~/Music/OFFENBACK/`.
+7b. ✅ **Synths**: live oscillator voices (Sine, Triangle, Saw, Square, Pulse 25 %, Super saw 7×) with PolyBLEP
+   anti-aliasing, chosen in the Instrument window next to the SFZ pianos. Attack/Decay/Sustain/Release are a
+   classic synth ADSR and greyed out for sampled instruments; LFO = vibrato (5.5 Hz); Resonance on the master
+   low-pass for every instrument.
 8. **Bluetooth tuning**: PipeWire bluez5 latency settings, SBC-XQ, latency offset measurement.
 
 ## Latency budget

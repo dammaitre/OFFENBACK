@@ -1,4 +1,4 @@
-//! Real-time sampler engine, run inside the audio callback.
+//! Real-time engine (sampler and synth voices), run inside the audio callback.
 //!
 //! Rules: no allocation, no locks, no syscalls besides `Instant::now()`. Commands arrive
 //! through a bounded lock-free channel and statistics leave through atomics. Replaced
@@ -12,9 +12,10 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::instrument::{CC_COUNT, Ctx, FilterKind, Instrument, Region, Trigger};
 use crate::midi::MidiEvent;
-use crate::params::{ParamId, Params, sustain_seconds, velocity_gamma};
+use crate::params::{LFO_RATE_HZ, ParamId, Params, velocity_gamma};
 use crate::recorder::{AudioBlock, BLOCK_FRAMES, RecMsg};
 use crate::reverb::Reverb;
+use crate::synth::{MAX_UNISON, oscillator};
 
 const MAX_VOICES: usize = 128;
 const BEND_RANGE_CENTS: f32 = 200.0;
@@ -25,8 +26,6 @@ const SILENCE: f32 = 1e-4;
 const LN_1000: f32 = 6.907_755;
 const ALL_SOUND_OFF_CC: u8 = 120;
 const ALL_NOTES_OFF_CC: u8 = 123;
-/// The physical sustain pedal; the matrix's virtual pedal is merged into it.
-const PEDAL_CC: usize = 64;
 /// Samples fade out over their last this-many seconds (at most 1/8 of their length), so a
 /// note held past the end of a short recording fades instead of cutting off.
 const TAIL_FADE_S: f32 = 0.25;
@@ -43,28 +42,21 @@ pub enum EngineCmd {
     Record(Option<Sender<RecMsg>>),
 }
 
-/// The matrix's Sustain: how long notes keep ringing after the key is released.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Sustain {
-    Off,
-    /// Released notes fade over at least this many seconds.
-    Ring(f32),
-    /// Like holding the sustain pedal down.
-    Pedal,
-}
-
 /// The effects matrix, converted to what the audio thread needs.
 #[derive(Clone, Copy)]
 struct User {
     gain: f32,
     transpose: i32,
     detune: f32,
-    attack_s: f32,
-    /// Extra fade-out time while held; `None` when Decay is off.
-    decay_s: Option<f32>,
-    sustain: Sustain,
-    release_mult: f32,
+    /// Synth envelope: seconds, seconds, level 0..1, seconds. Sampled instruments ignore it.
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+    /// Synth vibrato depth.
+    lfo_cents: f32,
     low_pass_hz: f32,
+    resonance_db: f32,
     high_pass_hz: f32,
     vel_gamma: f32,
     /// Reverb send level, 0..1 (1 ≈ as loud as the dry signal).
@@ -77,24 +69,17 @@ impl User {
             gain: db_to_gain(p.get(ParamId::Volume)),
             transpose: p.get(ParamId::Transpose).round() as i32,
             detune: 2f32.powf(p.get(ParamId::Detune) / 1200.0),
-            attack_s: p.get(ParamId::Attack) / 1000.0,
-            decay_s: (!p.is_default(ParamId::Decay)).then(|| p.get(ParamId::Decay)),
-            sustain: match sustain_seconds(p.get(ParamId::Sustain)) {
-                _ if p.get(ParamId::Sustain) >= 100.0 => Sustain::Pedal,
-                Some(s) => Sustain::Ring(s),
-                None => Sustain::Off,
-            },
-            release_mult: p.get(ParamId::Release),
+            attack: p.get(ParamId::Attack),
+            decay: p.get(ParamId::Decay),
+            sustain: p.get(ParamId::Sustain) / 100.0,
+            release: p.get(ParamId::Release),
+            lfo_cents: p.get(ParamId::Lfo),
             low_pass_hz: p.get(ParamId::LowPass),
+            resonance_db: p.get(ParamId::Resonance),
             high_pass_hz: p.get(ParamId::HighPass),
             vel_gamma: velocity_gamma(p.get(ParamId::Velocity)),
             reverb: p.get(ParamId::Reverb) / 100.0,
         }
-    }
-
-    /// Virtual pedal position, merged with the physical one.
-    fn pedal(&self) -> f32 {
-        if self.sustain == Sustain::Pedal { 1.0 } else { 0.0 }
     }
 
     fn velocity(&self, vel: u8) -> u8 {
@@ -326,10 +311,9 @@ struct Voice {
     step: f64,
     gain: [f32; 2],
     env: Env,
-    /// Extra Decay/Sustain fade from the matrix, on top of the instrument envelope.
-    fade: f32,
-    fade_floor: f32,
-    fade_coef: f32,
+    /// Synth voice: `step` is the base phase increment and `phases` the oscillators.
+    synth: bool,
+    phases: [f32; MAX_UNISON],
     /// Position where the end-of-sample fade starts, and 1 / its length.
     tail_start: f64,
     tail_inv: f32,
@@ -365,9 +349,8 @@ impl Voice {
             release_coef: 0.0,
             release_after_attack: false,
         },
-        fade: 1.0,
-        fade_floor: 1.0,
-        fade_coef: 1.0,
+        synth: false,
+        phases: [0.0; MAX_UNISON],
         tail_start: 0.0,
         tail_inv: 0.0,
         filter: None,
@@ -385,14 +368,15 @@ pub struct Engine {
     ccs: [f32; CC_COUNT],
     bend: f32,
     user: User,
-    /// Physical sustain pedal (CC64) as last received; `ccs[64]` holds the merged value.
-    pedal_cc: f32,
+    /// Free-running vibrato phase (0..1).
+    lfo_phase: f32,
     /// Smoothed master gain.
     gain: f32,
     gain_step: f32,
     low_pass: Biquad,
     high_pass: Biquad,
     low_pass_hz: f32,
+    low_pass_res: f32,
     high_pass_hz: f32,
     reverb: Reverb,
     /// Smoothed reverb send; the reverb is bypassed (and cleared) once it reaches 0.
@@ -435,12 +419,13 @@ impl Engine {
             voices: vec![Voice::IDLE; MAX_VOICES],
             bend: 1.0,
             user: User::new(&Params::default()),
-            pedal_cc: 0.0,
+            lfo_phase: 0.0,
             gain: 1.0,
             gain_step: 1.0 - (-1.0 / (0.01 * sr)).exp(),
             low_pass: Biquad::new(FilterKind::Lpf2p, 20_000.0, 0.0, sr),
             high_pass: Biquad::new(FilterKind::Hpf2p, 20.0, 0.0, sr),
             low_pass_hz: 20_000.0,
+            low_pass_res: 0.0,
             high_pass_hz: 20.0,
             reverb: Reverb::new(sr),
             reverb_send: 0.0,
@@ -478,10 +463,7 @@ impl Engine {
                     self.handle(event);
                 }
                 EngineCmd::SetInstrument(inst) => self.set_instrument(inst),
-                EngineCmd::Params(p) => {
-                    self.user = User::new(&p);
-                    self.apply_cc(PEDAL_CC, self.pedal_cc.max(self.user.pedal()));
-                }
+                EngineCmd::Params(p) => self.user = User::new(&p),
                 // The UI keeps its own sender, so dropping ours never wakes a thread from here.
                 EngineCmd::Record(tx) => self.recorder = tx,
             }
@@ -496,7 +478,6 @@ impl Engine {
             v.active = false;
         }
         self.ccs = inst.cc_defaults;
-        self.ccs[PEDAL_CC] = self.pedal_cc.max(self.user.pedal());
         self.sw_last = inst.sw_default;
         self.release_pending = [false; 128];
         let old = std::mem::replace(&mut self.inst, inst);
@@ -557,6 +538,10 @@ impl Engine {
         self.release_pending[n] = false;
 
         let inst = self.inst.clone();
+        if inst.synth.is_some() {
+            self.start_synth_voice(&inst, note, vel);
+            return;
+        }
         let rand = self.random();
         for &ri in &inst.by_key[n] {
             let r = &inst.regions[ri as usize];
@@ -582,7 +567,7 @@ impl Engine {
                 continue;
             }
             v.key_down = false;
-            if inst.regions[v.region as usize].one_shot {
+            if !v.synth && inst.regions[v.region as usize].one_shot {
                 continue;
             }
             if sustain {
@@ -603,13 +588,7 @@ impl Engine {
     }
 
     fn control(&mut self, cc: u8, value: u8) {
-        let v = value as f32 / 127.0;
-        if cc as usize == PEDAL_CC {
-            self.pedal_cc = v;
-            self.apply_cc(PEDAL_CC, v.max(self.user.pedal()));
-        } else {
-            self.apply_cc(cc as usize, v);
-        }
+        self.apply_cc(cc as usize, value as f32 / 127.0);
     }
 
     /// Sets controller `c` to `new` (0..1) and runs everything that depends on it.
@@ -661,7 +640,13 @@ impl Engine {
         // Half-pedalling: release times follow the controllers while fading.
         for i in 0..self.voices.len() {
             let v = &self.voices[i];
-            if v.active && !v.offed && v.env.stage == Stage::Release && inst.regions[v.region as usize].ampeg.dynamic {
+            // Check `active` first: idle slots may point at regions a synth doesn't have.
+            if v.active
+                && !v.synth
+                && !v.offed
+                && v.env.stage == Stage::Release
+                && inst.regions[v.region as usize].ampeg.dynamic
+            {
                 self.release_voice(&inst, i);
             }
         }
@@ -673,18 +658,18 @@ impl Engine {
 
     fn release_voice(&mut self, inst: &Instrument, i: usize) {
         let v = self.voices[i];
-        let r = &inst.regions[v.region as usize];
-        let mut seconds = r.ampeg.release.eval(&self.ctx(inst, v.note, v.vel)) * self.user.release_mult;
-        if let Sustain::Ring(ring) = self.user.sustain {
-            seconds = seconds.max(ring);
-        }
+        let seconds = if v.synth {
+            self.user.release
+        } else {
+            inst.regions[v.region as usize].ampeg.release.eval(&self.ctx(inst, v.note, v.vel))
+        };
         self.voices[i].env.release(seconds.max(0.0005), self.sr);
     }
 
     /// Fades a voice out because something else took its place.
     fn off_voice(&mut self, inst: &Instrument, i: usize) {
-        let r = &inst.regions[self.voices[i].region as usize];
-        match r.off_time {
+        let off_time = if self.voices[i].synth { None } else { inst.regions[self.voices[i].region as usize].off_time };
+        match off_time {
             Some(t) => {
                 self.voices[i].env.release(t.max(0.0005), self.sr);
             }
@@ -737,7 +722,7 @@ impl Engine {
         if r.group != 0 {
             for i in 0..self.voices.len() {
                 let v = &self.voices[i];
-                if v.active && !v.offed && inst.regions[v.region as usize].off_by == Some(r.group) {
+                if v.active && !v.offed && !v.synth && inst.regions[v.region as usize].off_by == Some(r.group) {
                     self.off_voice(inst, i);
                 }
             }
@@ -759,7 +744,7 @@ impl Engine {
         let e = &r.ampeg;
         let env = Env::new(
             e.delay.eval(&ctx),
-            e.attack.eval(&ctx) + self.user.attack_s,
+            e.attack.eval(&ctx),
             e.hold.eval(&ctx),
             e.decay.eval(&ctx),
             e.sustain.eval(&ctx),
@@ -784,9 +769,8 @@ impl Engine {
             step,
             gain: [gain * (1.0 - pan).min(1.0), gain * (1.0 + pan).min(1.0)],
             env,
-            fade: 1.0,
-            fade_floor: self.user.decay_s.map_or(1.0, |_| 0.0),
-            fade_coef: self.user.decay_s.map_or(1.0, |t| exp_coef(t, self.sr)),
+            synth: false,
+            phases: [0.0; MAX_UNISON],
             tail_start: (sample.frames - tail_len) as f64,
             tail_inv: 1.0 / tail_len as f32,
             filter,
@@ -795,8 +779,12 @@ impl Engine {
             offed: false,
             started: self.voice_counter,
         };
+        self.place_voice(voice);
+    }
+
+    /// Puts a new voice in a free slot, or in place of the quietest one.
+    fn place_voice(&mut self, voice: Voice) {
         let slot = self.voices.iter().position(|v| !v.active).unwrap_or_else(|| {
-            // Steal the quietest voice.
             (0..self.voices.len())
                 .min_by(|&a, &b| {
                     let level = |v: &Voice| v.env.level * (v.gain[0] + v.gain[1]);
@@ -807,14 +795,85 @@ impl Engine {
         self.voices[slot] = voice;
     }
 
+    fn start_synth_voice(&mut self, inst: &Instrument, note: u8, vel: u8) {
+        let Some(patch) = &inst.synth else { return };
+        let freq = 440.0 * 2f64.powf((note as f64 - 69.0) / 12.0);
+        let mut phases = [0.0; MAX_UNISON];
+        if patch.unison > 1 {
+            // Free-running feel: unison oscillators start out of phase.
+            for p in phases.iter_mut().take(patch.unison) {
+                *p = self.random();
+            }
+        }
+        let u = self.user;
+        let gain = patch.unison_gain() * (vel as f32 / 127.0).powi(2);
+        self.voice_counter += 1;
+        self.place_voice(Voice {
+            active: true,
+            note,
+            vel,
+            step: freq / self.sr as f64,
+            gain: [gain; 2],
+            env: Env::new(0.0, u.attack, 0.0, u.decay, u.sustain * 100.0, self.sr),
+            synth: true,
+            phases,
+            key_down: true,
+            started: self.voice_counter,
+            ..Voice::IDLE
+        });
+    }
+
     /// Fills `out` with stereo frames.
     pub fn render(&mut self, out: &mut [[f32; 2]]) {
         out.fill([0.0; 2]);
         self.update_master_filters(out.len());
         let inst = &*self.inst;
         let bend = (self.bend * self.user.detune) as f64;
+        // Vibrato for synth voices, updated once per block.
+        self.lfo_phase = (self.lfo_phase + out.len() as f32 * LFO_RATE_HZ / self.sr).fract();
+        let vibrato = 2f64.powf((self.user.lfo_cents * (self.lfo_phase * std::f32::consts::TAU).sin()) as f64 / 1200.0);
+        // Unison layout of the current synth patch: pitch ratio and L/R gains per oscillator.
+        let mut unison = [(1.0f64, 1.0f32, 1.0f32); MAX_UNISON];
+        let (waveform, oscillators) = match &inst.synth {
+            Some(p) => {
+                for (k, u) in unison.iter_mut().enumerate().take(p.unison) {
+                    let (ratio, pan) = p.unison_voice(k);
+                    *u = (ratio as f64, (1.0 - pan).min(1.0), (1.0 + pan).min(1.0));
+                }
+                (p.waveform, p.unison)
+            }
+            None => (crate::synth::Waveform::Sine, 0),
+        };
         let mut active = 0;
         for v in self.voices.iter_mut().filter(|v| v.active) {
+            if v.synth {
+                let step = v.step * bend * vibrato;
+                for frame in out.iter_mut() {
+                    let e = v.env.next();
+                    if v.env.stage == Stage::Done {
+                        v.active = false;
+                        break;
+                    }
+                    let (mut l, mut r) = (0.0, 0.0);
+                    for k in 0..oscillators {
+                        let (ratio, gl, gr) = unison[k];
+                        let dt = (step * ratio) as f32;
+                        let x = oscillator(waveform, v.phases[k], dt);
+                        v.phases[k] += dt;
+                        if v.phases[k] >= 1.0 {
+                            v.phases[k] -= 1.0;
+                        }
+                        l += x * gl;
+                        r += x * gr;
+                    }
+                    frame[0] += l * v.gain[0] * e;
+                    frame[1] += r * v.gain[1] * e;
+                }
+                if v.active {
+                    active += 1;
+                }
+                continue;
+            }
             let s = &inst.samples[inst.regions[v.region as usize].sample];
             let d = &s.data;
             let step = v.step * bend;
@@ -841,12 +900,7 @@ impl Engine {
                     l = f.process(0, l);
                     r = f.process(1, r);
                 }
-                v.fade = v.fade_floor + (v.fade - v.fade_floor) * v.fade_coef;
-                if v.fade < SILENCE {
-                    v.active = false;
-                    break;
-                }
-                let mut e = e * v.fade;
+                let mut e = e;
                 if v.pos > v.tail_start {
                     e *= ((s.frames as f64 - v.pos) as f32 * v.tail_inv).clamp(0.0, 1.0);
                 }
@@ -918,8 +972,10 @@ impl Engine {
             *current = (current.ln() + (target.ln() - current.ln()) * k).exp();
             true
         };
-        if glide(&mut self.low_pass_hz, self.user.low_pass_hz) {
-            self.low_pass.set(FilterKind::Lpf2p, self.low_pass_hz, 0.0, self.sr);
+        let res_changed = self.low_pass_res != self.user.resonance_db;
+        if glide(&mut self.low_pass_hz, self.user.low_pass_hz) || res_changed {
+            self.low_pass_res = self.user.resonance_db;
+            self.low_pass.set(FilterKind::Lpf2p, self.low_pass_hz, self.low_pass_res, self.sr);
         }
         if glide(&mut self.high_pass_hz, self.user.high_pass_hz) {
             self.high_pass.set(FilterKind::Hpf2p, self.high_pass_hz, 0.0, self.sr);
@@ -1215,94 +1271,6 @@ mod tests {
     }
 
     #[test]
-    fn release_multiplier_lengthens_tail() {
-        let mut rig = Rig::new(Instrument::builtin_sine(SR));
-        rig.set(&[(ParamId::Release, 80)]); // ×5: 0.08 s → 0.4 s
-        rig.send(on(69, 100));
-        rig.run(0.05);
-        rig.send(off(69));
-        rig.run(0.2);
-        assert_eq!(rig.active(), 1, "still fading after 0.2 s");
-        rig.run(0.5);
-        assert_eq!(rig.active(), 0);
-    }
-
-    #[test]
-    fn attack_adds_fade_in() {
-        let mut rig = Rig::new(Instrument::builtin_sine(SR));
-        rig.set(&[(ParamId::Attack, 50)]); // half the square scale: 500 ms
-        rig.send(on(69, 100));
-        rig.run(0.1);
-        let level = rig.engine.voices.iter().find(|v| v.active).unwrap().env.level;
-        assert!(level > 0.15 && level < 0.25, "{level}");
-    }
-
-    #[test]
-    fn decay_fades_held_notes_out() {
-        let mut rig = Rig::new(Instrument::builtin_sine(SR));
-        rig.set(&[(ParamId::Decay, -100)]); // 0.2 s
-        rig.send(on(69, 100));
-        rig.run(0.1);
-        assert_eq!(rig.active(), 1);
-        rig.run(0.3);
-        assert_eq!(rig.active(), 0, "held note faded out by Decay");
-    }
-
-    #[test]
-    fn sustain_ring_time_lengthens_released_notes() {
-        let mut rig = Rig::new(Instrument::builtin_sine(SR));
-        rig.set(&[(ParamId::Sustain, 50)]); // ~2 s
-        rig.send(on(69, 100));
-        rig.send(off(69));
-        rig.run(1.0);
-        assert_eq!(rig.active(), 1, "still ringing 1 s after release");
-        // -60 dB over the 2 s ring time; voices end at -80 dB, i.e. ~2.7 s.
-        rig.run(2.0);
-        assert_eq!(rig.active(), 0);
-    }
-
-    #[test]
-    fn sustain_pedal_mode_acts_like_the_pedal() {
-        let mut rig = Rig::new(Instrument::builtin_sine(SR));
-        rig.set(&[(ParamId::Sustain, 100)]);
-        assert_eq!(rig.engine.ccs[PEDAL_CC], 1.0);
-        rig.send(on(69, 100));
-        rig.send(off(69));
-        // The physical pedal going up must not cancel the virtual one.
-        rig.send(cc(64, 127));
-        rig.send(cc(64, 0));
-        rig.run(0.5);
-        assert_eq!(rig.active(), 1);
-        rig.set(&[]); // Sustain back to off = pedal lifted
-        assert_eq!(rig.engine.ccs[PEDAL_CC], 0.0);
-        rig.run(0.5);
-        assert_eq!(rig.active(), 0);
-    }
-
-    #[test]
-    fn splendid_virtual_pedal_adds_resonance_and_rings() {
-        let Some(home) = std::env::var_os("HOME") else { return };
-        let path = std::path::Path::new(&home).join("Sounds/SFZ/SplendidGrandPiano/Splendid Grand Piano.sfz");
-        if !path.exists() {
-            return;
-        }
-        let inst = crate::instrument::load_sfz(&path, &Default::default()).unwrap();
-        let mut rig = Rig::new(inst);
-        rig.send(on(60, 90));
-        assert_eq!(rig.active(), 1, "no pedal: just the note");
-        rig.send(off(60));
-        rig.run(2.0);
-        assert_eq!(rig.active(), 0, "damped within 2 s");
-
-        rig.set(&[(ParamId::Sustain, 100)]);
-        rig.send(on(60, 90));
-        assert_eq!(rig.active(), 2, "pedal: note + string resonance layer");
-        rig.send(off(60));
-        rig.run(2.0);
-        assert_eq!(rig.active(), 2, "still ringing with the virtual pedal");
-    }
-
-    #[test]
     fn reverb_adds_a_tail_and_bypasses_at_zero() {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
         rig.send(on(69, 100));
@@ -1339,6 +1307,151 @@ mod tests {
         assert!(last <= g * 0.4, "fading near the end: {last} vs {g}");
         rig.run(0.1);
         assert_eq!(rig.active(), 0);
+    }
+
+    fn synth(name: &str) -> Instrument {
+        let patch = crate::synth::PRESETS.iter().find(|p| p.name == name).unwrap().clone();
+        Instrument::synth(patch)
+    }
+
+    #[test]
+    fn synth_follows_its_adsr() {
+        let mut rig = Rig::new(synth("Saw"));
+        // Attack 0 → instant, Decay default 0.4 s to Sustain 50 %, Release 0.01 s.
+        rig.set(&[(ParamId::Attack, -100), (ParamId::Sustain, -20), (ParamId::Release, -100)]);
+        rig.send(on(57, 127));
+        rig.run(3.0);
+        let v = rig.engine.voices.iter().find(|v| v.active).unwrap();
+        assert!((v.env.level - 0.5).abs() < 0.01, "held at the sustain level: {}", v.env.level);
+        assert!(rig.rms(0.1) > 0.01, "a held synth note never runs out");
+        rig.send(off(57));
+        rig.run(0.05);
+        assert_eq!(rig.active(), 0, "10 ms release");
+    }
+
+    #[test]
+    fn synth_attack_ramps_up() {
+        let mut rig = Rig::new(synth("Sine"));
+        rig.set(&[(ParamId::Attack, 50)]); // ~1.4 s
+        let attack = rig.engine.user.attack;
+        assert!(attack > 1.0 && attack < 2.0, "{attack}");
+        rig.send(on(69, 127));
+        rig.run(0.25);
+        let elapsed = (0.25f32 * SR as f32 / 256.0).ceil() * 256.0 / SR as f32;
+        let level = rig.engine.voices.iter().find(|v| v.active).unwrap().env.level;
+        assert!((level - elapsed / attack).abs() < 0.01, "linear attack: {level}");
+    }
+
+    #[test]
+    fn synth_pitch_and_unison() {
+        let mut rig = Rig::new(synth("Super saw"));
+        rig.send(on(69, 100));
+        let v = *rig.engine.voices.iter().find(|v| v.active).unwrap();
+        assert!((v.step - 440.0 / SR as f64).abs() < 1e-12);
+        assert!(v.phases.iter().filter(|&&p| p != 0.0).count() >= 6, "unison phases randomised");
+        let out = rig.rms(0.1);
+        assert!(out > 0.01 && out < 0.5, "{out}");
+        // Wide unison: left and right differ.
+        assert!(rig.buf.iter().any(|f| (f[0] - f[1]).abs() > 1e-3));
+    }
+
+    #[test]
+    fn sampled_instruments_ignore_the_envelope_cells() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Attack, 100), (ParamId::Release, 100), (ParamId::Sustain, -100)]);
+        rig.send(on(69, 100));
+        let level = { rig.run(0.01); rig.engine.voices[0].env.level };
+        assert_eq!(level, 1.0, "no added attack");
+        rig.send(off(69));
+        rig.run(0.5);
+        assert_eq!(rig.active(), 0, "instrument's own 80 ms release, not 10 s");
+    }
+
+    #[test]
+    fn lfo_wobbles_synth_pitch() {
+        let mut rig = Rig::new(synth("Sine"));
+        rig.set(&[(ParamId::Lfo, 100)]); // ±100 cents
+        rig.send(on(69, 100));
+        // Measure phase advance per block over one LFO period: it must swing ~±6 %.
+        let (mut lo, mut hi) = (f32::MAX, 0.0f32);
+        for _ in 0..40 {
+            let before = rig.engine.voices[0].phases[0];
+            rig.engine.render(&mut rig.buf);
+            let mut adv = rig.engine.voices[0].phases[0] - before;
+            if adv < 0.0 {
+                adv += 1.0;
+            }
+            let cycles = adv + (440.0 * 256.0 / SR as f32).floor();
+            lo = lo.min(cycles);
+            hi = hi.max(cycles);
+        }
+        let swing = hi / lo;
+        assert!(swing > 1.08 && swing < 1.16, "max/min pitch ratio {swing}");
+    }
+
+    #[test]
+    fn resonance_boosts_around_the_cutoff() {
+        let level_at_cutoff = |res_steps: i32| {
+            let mut rig = Rig::new(synth("Sine"));
+            rig.set(&[(ParamId::LowPass, -60), (ParamId::Resonance, res_steps)]); // ~1.4 kHz
+            let cutoff = rig.engine.user.low_pass_hz;
+            let note = (69.0 + 12.0 * (cutoff / 440.0).log2()).round() as u8;
+            rig.send(on(note, 127));
+            rig.run(0.2);
+            rig.rms(0.1)
+        };
+        let flat = level_at_cutoff(0);
+        let peaked = level_at_cutoff(48); // 12 dB
+        let gain_db = 20.0 * (peaked / flat).log10();
+        assert!(gain_db > 6.0, "resonance gain at cutoff: {gain_db} dB");
+    }
+
+    /// Throws a long random stream of MIDI and matrix changes at every kind of instrument.
+    /// Guards against out-of-bounds lookups that would kill the audio thread.
+    #[test]
+    fn random_events_never_panic() {
+        let mut instruments: Vec<Instrument> = vec![Instrument::builtin_sine(SR)];
+        instruments.extend(crate::synth::PRESETS.iter().cloned().map(Instrument::synth));
+        if let Some(home) = std::env::var_os("HOME") {
+            for f in [
+                "Sounds/SFZ/SplendidGrandPiano/Splendid Grand Piano.sfz",
+                "Sounds/SFZ/SalamanderGrandPiano/Salamander Grand Piano V3.sfz",
+            ] {
+                let path = std::path::Path::new(&home).join(f);
+                if path.exists() {
+                    instruments.push(crate::instrument::load_sfz(&path, &Default::default()).unwrap());
+                }
+            }
+        }
+        let mut seed = 12345u32;
+        let mut rnd = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % n
+        };
+        for inst in instruments {
+            let mut rig = Rig::new(inst);
+            for _ in 0..3000 {
+                let event = match rnd(10) {
+                    0..=3 => on(rnd(128) as u8, 1 + rnd(127) as u8),
+                    4..=6 => off(rnd(128) as u8),
+                    7 => cc(64, if rnd(2) == 0 { 0 } else { 127 }),
+                    8 => cc(rnd(128) as u8, rnd(128) as u8),
+                    _ => MidiEvent::PitchBend { ch: 0, value: rnd(16384) as i16 - 8192 },
+                };
+                rig.send(event);
+                if rnd(50) == 0 {
+                    let id = ParamId::ALL[rnd(ParamId::ALL.len() as u32) as usize];
+                    rig.set(&[(id, rnd(200) as i32 - 100)]);
+                }
+                if rnd(4) == 0 {
+                    rig.engine.render(&mut rig.buf);
+                    assert!(rig.buf.iter().all(|f| f[0].is_finite() && f[0].abs() <= 1.0));
+                }
+            }
+            rig.send(cc(ALL_NOTES_OFF_CC, 0));
+        }
     }
 
     #[test]

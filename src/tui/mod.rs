@@ -21,6 +21,7 @@ use crate::instrument::{self, Instrument, Progress};
 use crate::midi::{self, MidiEvent};
 use crate::params::{ParamId, Params};
 use crate::recorder::{RecMsg, Recording};
+use crate::synth::PRESETS;
 
 const SUSTAIN_CC: u8 = 64;
 /// Buffer sizes offered with `[` / `]`; past the end means "server default".
@@ -29,7 +30,7 @@ const DEFAULT_BUFFER: u32 = 128;
 const TEST_NOTE: u8 = 60;
 const TEST_NOTE_LENGTH: Duration = Duration::from_millis(600);
 /// Matrix shape: parameters are laid out row by row.
-const MATRIX_COLS: usize = 4;
+const MATRIX_COLS: usize = 5;
 /// Steps per PgUp/PgDn.
 const COARSE_STEPS: i32 = 10;
 
@@ -43,6 +44,14 @@ enum Popup {
 struct Connection {
     name: String,
     _conn: MidiInputConnection<()>,
+}
+
+/// Something the Instrument window can load.
+#[derive(Clone, PartialEq)]
+enum Source {
+    /// Index into `synth::PRESETS`.
+    Synth(usize),
+    Sfz(PathBuf),
 }
 
 struct Loading {
@@ -63,12 +72,12 @@ pub struct App {
     engine_rx: Receiver<EngineCmd>,
     stats: Arc<Stats>,
     instrument: Arc<Instrument>,
-    instrument_path: Option<PathBuf>,
+    instrument_source: Option<Source>,
     loading: Option<Loading>,
     /// Instruments the audio thread no longer uses; dropped here, off the real-time thread.
     garbage_tx: Sender<Arc<Instrument>>,
     garbage_rx: Receiver<Arc<Instrument>>,
-    instruments: Vec<PathBuf>,
+    instruments: Vec<Source>,
     instrument_list: ListState,
     audio: Option<AudioOut>,
     audio_error: Option<String>,
@@ -117,8 +126,9 @@ impl App {
             engine_tx,
             engine_rx,
             stats: Arc::new(Stats::default()),
-            instrument: Arc::new(Instrument::builtin_sine(48_000)),
-            instrument_path: None,
+            // Until an SFZ loads (or if none is installed), play the plain sine synth.
+            instrument: Arc::new(Instrument::synth(PRESETS[0].clone())),
+            instrument_source: Some(Source::Synth(0)),
             loading: None,
             garbage_tx,
             garbage_rx,
@@ -256,6 +266,19 @@ impl App {
         }
     }
 
+    fn select_instrument(&mut self, source: Source) {
+        match source {
+            Source::Synth(i) => {
+                self.loading = None;
+                self.instrument = Arc::new(Instrument::synth(PRESETS[i].clone()));
+                let _ = self.engine_tx.try_send(EngineCmd::SetInstrument(self.instrument.clone()));
+                self.status = format!("{} ready", self.instrument.name);
+                self.instrument_source = Some(source);
+            }
+            Source::Sfz(path) => self.load_instrument(path),
+        }
+    }
+
     fn load_instrument(&mut self, path: PathBuf) {
         let progress = Arc::new(Progress::default());
         let name = path.file_stem().map_or("instrument".into(), |s| s.to_string_lossy().into_owned());
@@ -263,7 +286,7 @@ impl App {
         let load_path = path.clone();
         let handle = std::thread::spawn(move || instrument::load_sfz(&load_path, &p));
         self.status = format!("loading {name}…");
-        self.instrument_path = Some(path);
+        self.instrument_source = Some(Source::Sfz(path));
         self.loading = Some(Loading { name, progress, handle });
     }
 
@@ -355,11 +378,14 @@ impl App {
     }
 
     fn refresh_instruments(&mut self) {
-        self.instruments = find_sfz_files();
+        self.instruments = (0..PRESETS.len())
+            .map(Source::Synth)
+            .chain(find_sfz_files().into_iter().map(Source::Sfz))
+            .collect();
         let current = self
-            .instrument_path
+            .instrument_source
             .as_ref()
-            .and_then(|p| self.instruments.iter().position(|i| i == p));
+            .and_then(|c| self.instruments.iter().position(|i| i == c));
         self.instrument_list.select(current.or((!self.instruments.is_empty()).then_some(0)));
     }
 
@@ -414,11 +440,15 @@ impl App {
             KeyCode::Down if self.selected / MATRIX_COLS < (count - 1) / MATRIX_COLS => {
                 self.selected = (self.selected + MATRIX_COLS).min(count - 1)
             }
-            KeyCode::Char('+' | '=') => self.params.nudge(selected, 1),
-            KeyCode::Char('-') => self.params.nudge(selected, -1),
-            KeyCode::PageUp => self.params.nudge(selected, COARSE_STEPS),
-            KeyCode::PageDown => self.params.nudge(selected, -COARSE_STEPS),
-            KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => self.params.reset(selected),
+            KeyCode::Char('+' | '=') => self.edit(selected, 1),
+            KeyCode::Char('-') => self.edit(selected, -1),
+            KeyCode::PageUp => self.edit(selected, COARSE_STEPS),
+            KeyCode::PageDown => self.edit(selected, -COARSE_STEPS),
+            KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => {
+                if self.is_enabled(selected) {
+                    self.params.reset(selected);
+                }
+            }
             _ => {}
         }
     }
@@ -472,9 +502,9 @@ impl App {
                 }
             }
             Popup::Instrument => {
-                if let Some(path) = self.instrument_list.selected().and_then(|i| self.instruments.get(i)).cloned() {
+                if let Some(source) = self.instrument_list.selected().and_then(|i| self.instruments.get(i)).cloned() {
                     if self.loading.is_none() {
-                        self.load_instrument(path);
+                        self.select_instrument(source);
                         self.popup = None;
                     }
                 }
@@ -499,7 +529,20 @@ impl App {
             if up { list.select_previous() } else { list.select_next() }
         } else {
             // Reversed on request: matches natural (touchpad) scrolling.
-            self.params.nudge(ParamId::ALL[self.selected], if up { -1 } else { 1 });
+            self.edit(ParamId::ALL[self.selected], if up { -1 } else { 1 });
+        }
+    }
+
+    /// Envelope and LFO cells only do something on synths.
+    fn is_enabled(&self, id: ParamId) -> bool {
+        !id.synth_only() || self.instrument.synth.is_some()
+    }
+
+    fn edit(&mut self, id: ParamId, steps: i32) {
+        if self.is_enabled(id) {
+            self.params.nudge(id, steps);
+        } else {
+            self.status = format!("{} only applies to synths (choose one with i)", id.spec().name);
         }
     }
 }
