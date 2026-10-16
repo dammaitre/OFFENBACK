@@ -55,6 +55,8 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 7c. ✅ **Layers**: up to 8 instruments play together, each with its own matrix settings; shared reverb,
    limiter and recorder. Layer bar under the top bar; Alt+Enter instrument, Alt+N new piano, Alt+D duplicate,
    Alt+M mute, Alt+K remove, Alt+←→ select. Layers using the same SFZ share its samples.
+   Bass presets: "Bass" (saw + sub octave, drive, mono, filter pluck) and "Sub bass" (driven sine, mono);
+   presets can carry suggested matrix values.
 8. **Bluetooth tuning**: PipeWire bluez5 latency settings, SBC-XQ, latency offset measurement.
 
 ## Latency budget

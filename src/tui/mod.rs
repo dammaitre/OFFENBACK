@@ -359,7 +359,16 @@ impl App {
         match source {
             Source::Synth(i) => {
                 let inst = Arc::new(Instrument::synth(PRESETS[i].clone()));
-                self.status = format!("{} ready", inst.name);
+                // Presets like the basses come with their own filter/envelope settings.
+                let suggested = PRESETS[i].params;
+                for &(param, value) in suggested {
+                    self.layer_mut().params.set(param, value);
+                }
+                self.status = if suggested.is_empty() {
+                    format!("{} ready", inst.name)
+                } else {
+                    format!("{} ready, with its suggested settings", inst.name)
+                };
                 self.set_layer_instrument(id, inst, Some(source));
             }
             Source::Sfz(path) => self.load_instrument(path, id),

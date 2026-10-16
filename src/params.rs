@@ -318,6 +318,12 @@ impl Params {
         self.values[id as usize] = if k == 0 { spec.default } else { spec.from_norm(n) };
     }
 
+    /// Sets `id` to `value`, clamped to its range (presets).
+    pub fn set(&mut self, id: ParamId, value: f32) {
+        let spec = id.spec();
+        self.values[id as usize] = value.clamp(spec.min, spec.max);
+    }
+
     pub fn reset(&mut self, id: ParamId) {
         self.values[id as usize] = id.spec().default;
     }

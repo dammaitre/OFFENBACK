@@ -17,7 +17,7 @@ use crate::midi::MidiEvent;
 use crate::params::{ParamId, Params, velocity_gamma};
 use crate::recorder::{AudioBlock, BLOCK_FRAMES, RecMsg};
 use crate::reverb::Reverb;
-use crate::synth::{MAX_UNISON, oscillator};
+use crate::synth::{MAX_UNISON, oscillator, saturate};
 
 const MAX_VOICES: usize = 128;
 const BEND_RANGE_CENTS: f32 = 200.0;
@@ -38,6 +38,8 @@ const HIGH_PASS_OFF_HZ: f32 = 20.5;
 const FILTER_UPDATE_FRAMES: usize = 32;
 /// Notes starting this close together are a chord: they don't glide from one another.
 const GLIDE_CHORD_S: f32 = 0.03;
+/// How fast a mono synth fades the previous note when a new one starts.
+const MONO_HANDOVER_S: f32 = 0.01;
 
 pub const MAX_LAYERS: usize = 8;
 
@@ -363,6 +365,8 @@ struct Voice {
     /// Synth voice: `step` is the base phase increment and `phases` the oscillators.
     synth: bool,
     phases: [f32; MAX_UNISON],
+    /// Sub-oscillator phase (one octave below).
+    sub_phase: f32,
     /// Synth filter envelope (same attack/decay as the amplitude, falls back to 0).
     fenv: Env,
     /// Glide: current pitch / target pitch, easing to 1.
@@ -395,6 +399,7 @@ impl Voice {
         env: Env::IDLE,
         synth: false,
         phases: [0.0; MAX_UNISON],
+        sub_phase: 0.0,
         fenv: Env::IDLE,
         glide_ratio: 1.0,
         glide_coef: 0.0,
@@ -942,6 +947,7 @@ impl Layer {
             env,
             synth: false,
             phases: [0.0; MAX_UNISON],
+            sub_phase: 0.0,
             fenv: Env::IDLE,
             glide_ratio: 1.0,
             glide_coef: 0.0,
@@ -992,6 +998,13 @@ impl Layer {
             _ => 1.0,
         };
         self.last_synth_note = Some((step, self.clock));
+        if patch.mono {
+            for v in self.voices.iter_mut().filter(|v| v.active && v.synth && !v.offed) {
+                v.env.release(MONO_HANDOVER_S, self.sr);
+                v.offed = true;
+                v.key_down = false;
+            }
+        }
         let gain = patch.unison_gain() * (vel as f32 / 127.0).powi(2);
         self.voice_counter += 1;
         self.place_voice(Voice {
@@ -1030,15 +1043,16 @@ impl Layer {
         let vibrato = 2f64.powf((self.user.lfo_cents * (self.lfo_phase * std::f32::consts::TAU).sin()) as f64 / 1200.0);
         // Unison layout of the current synth patch: pitch ratio and L/R gains per oscillator.
         let mut unison = [(1.0f64, 1.0f32, 1.0f32); MAX_UNISON];
-        let (waveform, oscillators) = match &inst.synth {
+        let (waveform, oscillators, sub, drive) = match &inst.synth {
             Some(p) => {
                 for (k, u) in unison.iter_mut().enumerate().take(p.unison) {
                     let (ratio, pan) = p.unison_voice(k);
                     *u = (ratio as f64, (1.0 - pan).min(1.0), (1.0 + pan).min(1.0));
                 }
-                (p.waveform, p.unison)
+                // The sub is mixed per oscillator, so scale it back to the patch level.
+                (p.waveform, p.unison, p.sub * (p.unison as f32).sqrt(), p.drive)
             }
-            None => (crate::synth::Waveform::Sine, 0),
+            None => (crate::synth::Waveform::Sine, 0, 0.0, 0.0),
         };
         // Synths filter each voice (so the filter envelope can sweep it); pianos use the
         // master low-pass below.
@@ -1073,6 +1087,20 @@ impl Layer {
                         }
                         l += x * gl;
                         r += x * gr;
+                    }
+                    if sub > 0.0 {
+                        let dt = (step * 0.5) as f32;
+                        let x = sub * (v.sub_phase * std::f32::consts::TAU).sin();
+                        v.sub_phase += dt;
+                        if v.sub_phase >= 1.0 {
+                            v.sub_phase -= 1.0;
+                        }
+                        l += x;
+                        r += x;
+                    }
+                    if drive > 0.0 {
+                        l = saturate(l, drive);
+                        r = saturate(r, drive);
                     }
                     if filter_on {
                         if let Some(f) = v.filter.as_mut() {
@@ -1525,6 +1553,54 @@ mod tests {
         rig.send(off(57));
         rig.run(0.05);
         assert_eq!(rig.active(), 0, "10 ms release");
+    }
+
+    /// Goertzel power of `x` at `freq`.
+    fn power_at(x: &[f32], freq: f32) -> f32 {
+        let w = std::f32::consts::TAU * freq / SR as f32;
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for &v in x {
+            let s = v + 2.0 * w.cos() * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        (s1 * s1 + s2 * s2 - 2.0 * w.cos() * s1 * s2) / x.len() as f32
+    }
+
+    #[test]
+    fn bass_has_a_sub_octave_and_plays_mono() {
+        let mut rig = Rig::new(synth("Bass"));
+        rig.send(on(45, 127)); // A2, 110 Hz
+        rig.run(0.2);
+        let mut left = Vec::new();
+        for _ in 0..40 {
+            rig.engine.render(&mut rig.buf);
+            left.extend(rig.buf.iter().map(|f| f[0]));
+        }
+        let (sub, fundamental) = (power_at(&left, 55.0), power_at(&left, 110.0));
+        assert!(sub > fundamental * 0.2, "sub octave present: {sub} vs {fundamental}");
+
+        rig.send(on(48, 127));
+        let live = rig.layer().voices.iter().filter(|v| v.active && !v.offed).count();
+        assert_eq!(live, 1, "mono: the new note replaces the old one");
+        rig.run(0.05);
+        assert_eq!(rig.active(), 1, "previous note faded out within 10 ms");
+    }
+
+    #[test]
+    fn drive_adds_harmonics_to_the_sub_bass() {
+        let render = |name: &str| {
+            let mut rig = Rig::new(synth(name));
+            rig.send(on(33, 127)); // A1, 55 Hz
+            rig.run(0.3);
+            let mut left = Vec::new();
+            for _ in 0..40 {
+                rig.engine.render(&mut rig.buf);
+                left.extend(rig.buf.iter().map(|f| f[0]));
+            }
+            power_at(&left, 165.0) / power_at(&left, 55.0)
+        };
+        assert!(render("Sub bass") > render("Sine") * 100.0, "3rd harmonic from drive");
     }
 
     #[test]

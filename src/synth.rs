@@ -3,6 +3,8 @@
 //! Saw, square and pulse use PolyBLEP: the waveform's jumps are smoothed by a 2-sample
 //! polynomial residual, which removes most aliasing at a tiny cost.
 
+use crate::params::ParamId;
+
 /// Most oscillators one synth voice runs (super saw).
 pub const MAX_UNISON: usize = 7;
 
@@ -26,15 +28,60 @@ pub struct SynthPatch {
     pub spread_cents: f32,
     /// Output level, balancing the waveforms' different loudness.
     pub gain: f32,
+    /// Level of a sine one octave below, relative to the main oscillators.
+    pub sub: f32,
+    /// Saturation before the filter (0 = clean). Adds harmonics a small speaker can play.
+    pub drive: f32,
+    /// One note at a time: a new note fades the previous one out.
+    pub mono: bool,
+    /// Matrix values the preset suggests, applied when it's chosen.
+    pub params: &'static [(ParamId, f32)],
 }
 
-pub const PRESETS: [SynthPatch; 6] = [
-    SynthPatch { name: "Sine", waveform: Waveform::Sine, unison: 1, spread_cents: 0.0, gain: 0.35 },
-    SynthPatch { name: "Triangle", waveform: Waveform::Triangle, unison: 1, spread_cents: 0.0, gain: 0.35 },
-    SynthPatch { name: "Saw", waveform: Waveform::Saw, unison: 1, spread_cents: 0.0, gain: 0.3 },
-    SynthPatch { name: "Square", waveform: Waveform::Square, unison: 1, spread_cents: 0.0, gain: 0.2 },
-    SynthPatch { name: "Pulse 25%", waveform: Waveform::Pulse(0.25), unison: 1, spread_cents: 0.0, gain: 0.24 },
-    SynthPatch { name: "Super saw", waveform: Waveform::Saw, unison: 7, spread_cents: 25.0, gain: 0.3 },
+/// A plain polyphonic patch: one waveform, no extras.
+const fn basic(name: &'static str, waveform: Waveform, gain: f32) -> SynthPatch {
+    SynthPatch { name, waveform, unison: 1, spread_cents: 0.0, gain, sub: 0.0, drive: 0.0, mono: false, params: &[] }
+}
+
+pub const PRESETS: [SynthPatch; 8] = [
+    basic("Sine", Waveform::Sine, 0.35),
+    basic("Triangle", Waveform::Triangle, 0.35),
+    basic("Saw", Waveform::Saw, 0.3),
+    basic("Square", Waveform::Square, 0.2),
+    basic("Pulse 25%", Waveform::Pulse(0.25), 0.24),
+    SynthPatch { name: "Super saw", unison: 7, spread_cents: 25.0, ..basic("", Waveform::Saw, 0.3) },
+    SynthPatch {
+        name: "Bass",
+        sub: 0.7,
+        drive: 1.5,
+        mono: true,
+        params: &[
+            (ParamId::LowPass, 700.0),
+            (ParamId::Resonance, 4.0),
+            (ParamId::FilterEnv, 2.5),
+            (ParamId::Attack, 0.002),
+            (ParamId::Decay, 0.25),
+            (ParamId::Sustain, 55.0),
+            (ParamId::Release, 0.08),
+            (ParamId::Glide, 0.06),
+        ],
+        ..basic("", Waveform::Saw, 0.3)
+    },
+    SynthPatch {
+        name: "Sub bass",
+        drive: 2.5,
+        mono: true,
+        params: &[
+            (ParamId::LowPass, 20_000.0),
+            (ParamId::FilterEnv, 0.0),
+            (ParamId::Attack, 0.003),
+            (ParamId::Decay, 0.5),
+            (ParamId::Sustain, 80.0),
+            (ParamId::Release, 0.1),
+            (ParamId::Glide, 0.04),
+        ],
+        ..basic("", Waveform::Sine, 0.4)
+    },
 ];
 
 impl SynthPatch {
@@ -79,6 +126,22 @@ pub fn oscillator(waveform: Waveform, phase: f32, dt: f32) -> f32 {
         Waveform::Square => pulse(phase, dt, 0.5),
         Waveform::Pulse(width) => pulse(phase, dt, width),
     }
+}
+
+/// Saturation normalised so a full-scale input stays full scale; `drive` 0 is clean.
+#[inline]
+pub fn saturate(x: f32, drive: f32) -> f32 {
+    if drive <= 0.0 {
+        return x;
+    }
+    let k = 1.0 + drive;
+    fast_tanh(x * k) / fast_tanh(k)
+}
+
+#[inline]
+fn fast_tanh(x: f32) -> f32 {
+    let x = x.clamp(-3.0, 3.0);
+    x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
 }
 
 #[inline]
@@ -157,6 +220,13 @@ mod tests {
             .collect();
         let ratio = inharmonic_energy(&blep, freq, sr) / inharmonic_energy(&naive, freq, sr);
         assert!(ratio < 0.25, "PolyBLEP keeps {ratio} of the naive aliasing");
+    }
+
+    #[test]
+    fn drive_adds_harmonics_but_keeps_scale() {
+        assert_eq!(saturate(0.3, 0.0), 0.3);
+        assert!((saturate(1.0, 2.5) - 1.0).abs() < 1e-6);
+        assert!(saturate(0.3, 2.5) > 0.3, "quiet parts are lifted (compression)");
     }
 
     #[test]
