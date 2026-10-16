@@ -1,7 +1,6 @@
 //! MIDI input: port discovery, connection, and decoding raw bytes into events.
 
 use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::Sender;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 
 const CLIENT_NAME: &str = "OFFENBACK";
@@ -53,8 +52,11 @@ pub fn list_ports() -> Result<Vec<String>> {
 }
 
 /// Connects to the first port whose name contains `query` (case-insensitive).
-/// Decoded events are pushed to `tx` from midir's callback thread.
-pub fn connect(query: &str, tx: Sender<TimedEvent>) -> Result<(String, MidiInputConnection<()>)> {
+/// `on_event` runs on midir's callback thread for every decoded event, so keep it short.
+pub fn connect<F>(query: &str, mut on_event: F) -> Result<(String, MidiInputConnection<()>)>
+where
+    F: FnMut(TimedEvent) + Send + 'static,
+{
     let mut input = MidiInput::new(CLIENT_NAME).context("cannot open the ALSA sequencer")?;
     // Drop sysex, clock and active sensing: we only care about performance data.
     input.ignore(Ignore::All);
@@ -77,7 +79,7 @@ pub fn connect(query: &str, tx: Sender<TimedEvent>) -> Result<(String, MidiInput
             "offenback-in",
             move |micros, bytes, _| {
                 if let Some(event) = MidiEvent::parse(bytes) {
-                    let _ = tx.try_send(TimedEvent { micros, event });
+                    on_event(TimedEvent { micros, event });
                 }
             },
             (),
