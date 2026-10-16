@@ -28,7 +28,7 @@ const DEFAULT_BUFFER: u32 = 128;
 const TEST_NOTE: u8 = 60;
 const TEST_NOTE_LENGTH: Duration = Duration::from_millis(600);
 /// Matrix shape: parameters are laid out row by row.
-const MATRIX_COLS: usize = 5;
+const MATRIX_COLS: usize = 4;
 /// Steps per PgUp/PgDn.
 const COARSE_STEPS: i32 = 10;
 
@@ -340,12 +340,15 @@ impl App {
             KeyCode::Left => self.selected = self.selected.saturating_sub(1),
             KeyCode::Right => self.selected = (self.selected + 1).min(count - 1),
             KeyCode::Up => self.selected = self.selected.saturating_sub(MATRIX_COLS),
-            KeyCode::Down if self.selected + MATRIX_COLS < count => self.selected += MATRIX_COLS,
+            // The last row may be shorter: land on its last cell rather than not moving.
+            KeyCode::Down if self.selected / MATRIX_COLS < (count - 1) / MATRIX_COLS => {
+                self.selected = (self.selected + MATRIX_COLS).min(count - 1)
+            }
             KeyCode::Char('+' | '=') => self.params.nudge(selected, 1),
             KeyCode::Char('-') => self.params.nudge(selected, -1),
             KeyCode::PageUp => self.params.nudge(selected, COARSE_STEPS),
             KeyCode::PageDown => self.params.nudge(selected, -COARSE_STEPS),
-            KeyCode::Backspace | KeyCode::Delete => self.params.reset(selected),
+            KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => self.params.reset(selected),
             _ => {}
         }
     }

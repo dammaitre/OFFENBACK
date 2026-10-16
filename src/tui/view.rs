@@ -25,7 +25,7 @@ impl App {
     pub(super) fn draw(&mut self, f: &mut Frame) {
         let [top, main, keyboard, bottom] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Min(CELL_HEIGHT * 2 + 2),
+            Constraint::Min(CELL_HEIGHT * ParamId::ALL.len().div_ceil(MATRIX_COLS) as u16 + 2),
             Constraint::Length(3),
             Constraint::Length(1),
         ])

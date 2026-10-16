@@ -18,16 +18,16 @@ pub enum ParamId {
 }
 
 impl ParamId {
-    /// Matrix order: envelope on the first row, effects on the second.
+    /// Matrix order, 4 per row: level & pitch, envelope, filters.
     pub const ALL: [ParamId; 10] = [
         ParamId::Volume,
+        ParamId::Transpose,
+        ParamId::Detune,
+        ParamId::Reverb,
         ParamId::Attack,
         ParamId::Decay,
         ParamId::Sustain,
         ParamId::Release,
-        ParamId::Reverb,
-        ParamId::Transpose,
-        ParamId::Detune,
         ParamId::LowPass,
         ParamId::HighPass,
     ];
@@ -196,12 +196,13 @@ impl Spec {
 
 #[derive(Clone, Debug)]
 pub struct Params {
-    values: [f32; ParamId::ALL.len()],
+    values: [f32; SPECS.len()],
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Self { values: ParamId::ALL.map(|p| p.spec().default) }
+        // Indexed by `ParamId as usize` (= SPECS order), not by matrix order.
+        Self { values: std::array::from_fn(|i| SPECS[i].default) }
     }
 }
 
