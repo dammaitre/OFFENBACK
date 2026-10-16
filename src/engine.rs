@@ -13,6 +13,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::instrument::{CC_COUNT, Ctx, FilterKind, Instrument, Region, Trigger};
 use crate::midi::MidiEvent;
 use crate::params::{ParamId, Params, sustain_seconds, velocity_gamma};
+use crate::reverb::Reverb;
 
 const MAX_VOICES: usize = 128;
 const BEND_RANGE_CENTS: f32 = 200.0;
@@ -25,6 +26,9 @@ const ALL_SOUND_OFF_CC: u8 = 120;
 const ALL_NOTES_OFF_CC: u8 = 123;
 /// The physical sustain pedal; the matrix's virtual pedal is merged into it.
 const PEDAL_CC: usize = 64;
+/// Samples fade out over their last this-many seconds (at most 1/8 of their length), so a
+/// note held past the end of a short recording fades instead of cutting off.
+const TAIL_FADE_S: f32 = 0.25;
 /// Master filters at these cutoffs are bypassed.
 const LOW_PASS_OFF_HZ: f32 = 19_900.0;
 const HIGH_PASS_OFF_HZ: f32 = 20.5;
@@ -60,6 +64,8 @@ struct User {
     low_pass_hz: f32,
     high_pass_hz: f32,
     vel_gamma: f32,
+    /// Reverb send level, 0..1 (1 ≈ as loud as the dry signal).
+    reverb: f32,
 }
 
 impl User {
@@ -79,6 +85,7 @@ impl User {
             low_pass_hz: p.get(ParamId::LowPass),
             high_pass_hz: p.get(ParamId::HighPass),
             vel_gamma: velocity_gamma(p.get(ParamId::Velocity)),
+            reverb: p.get(ParamId::Reverb) / 100.0,
         }
     }
 
@@ -318,6 +325,9 @@ struct Voice {
     fade: f32,
     fade_floor: f32,
     fade_coef: f32,
+    /// Position where the end-of-sample fade starts, and 1 / its length.
+    tail_start: f64,
+    tail_inv: f32,
     filter: Option<Biquad>,
     /// Key physically held down.
     key_down: bool,
@@ -353,6 +363,8 @@ impl Voice {
         fade: 1.0,
         fade_floor: 1.0,
         fade_coef: 1.0,
+        tail_start: 0.0,
+        tail_inv: 0.0,
         filter: None,
         key_down: false,
         sustained: false,
@@ -377,6 +389,10 @@ pub struct Engine {
     high_pass: Biquad,
     low_pass_hz: f32,
     high_pass_hz: f32,
+    reverb: Reverb,
+    /// Smoothed reverb send; the reverb is bypassed (and cleared) once it reaches 0.
+    reverb_send: f32,
+    reverb_running: bool,
     sw_last: Option<u8>,
     /// Sounding note for each held input key (input key + transpose at note-on time).
     key_map: [Option<u8>; 128],
@@ -420,6 +436,9 @@ impl Engine {
             high_pass: Biquad::new(FilterKind::Hpf2p, 20.0, 0.0, sr),
             low_pass_hz: 20_000.0,
             high_pass_hz: 20.0,
+            reverb: Reverb::new(sr),
+            reverb_send: 0.0,
+            reverb_running: false,
             key_map: [None; 128],
             key_vel: [0; 128],
             key_time: [0; 128],
@@ -742,6 +761,7 @@ impl Engine {
             Biquad::new(f.kind, f.cutoff_hz * 2f32.powf(cents / 1200.0), f.resonance_db, self.sr)
         });
         let offset = r.offset.eval(&ctx).max(0.0) as f64;
+        let tail_len = ((TAIL_FADE_S * sample.rate as f32) as usize).min(sample.frames / 8).max(1);
 
         self.voice_counter += 1;
         let voice = Voice {
@@ -758,6 +778,8 @@ impl Engine {
             fade: 1.0,
             fade_floor: self.user.decay_s.map_or(1.0, |_| 0.0),
             fade_coef: self.user.decay_s.map_or(1.0, |t| exp_coef(t, self.sr)),
+            tail_start: (sample.frames - tail_len) as f64,
+            tail_inv: 1.0 / tail_len as f32,
             filter,
             key_down: r.trigger == Trigger::Attack,
             sustained: false,
@@ -815,7 +837,10 @@ impl Engine {
                     v.active = false;
                     break;
                 }
-                let e = e * v.fade;
+                let mut e = e * v.fade;
+                if v.pos > v.tail_start {
+                    e *= ((s.frames as f64 - v.pos) as f32 * v.tail_inv).clamp(0.0, 1.0);
+                }
                 frame[0] += l * v.gain[0] * e;
                 frame[1] += r * v.gain[1] * e;
                 v.pos += step;
@@ -827,17 +852,33 @@ impl Engine {
 
         let lp_on = self.low_pass_hz < LOW_PASS_OFF_HZ;
         let hp_on = self.high_pass_hz > HIGH_PASS_OFF_HZ;
+        let reverb_wanted = self.user.reverb > 0.0;
+        if reverb_wanted {
+            self.reverb_running = true;
+        } else if self.reverb_running && self.reverb_send < 1e-4 {
+            // Fully faded out: stop processing, and drop the old tail so it can't come back.
+            self.reverb_running = false;
+            self.reverb_send = 0.0;
+            self.reverb.clear();
+        }
         for frame in out.iter_mut() {
             self.gain += (self.user.gain - self.gain) * self.gain_step;
             for (c, s) in frame.iter_mut().enumerate() {
-                let mut x = *s;
                 if lp_on {
-                    x = self.low_pass.process(c, x);
+                    *s = self.low_pass.process(c, *s);
                 }
                 if hp_on {
-                    x = self.high_pass.process(c, x);
+                    *s = self.high_pass.process(c, *s);
                 }
-                *s = soft_clip(x * self.gain * MASTER_GAIN);
+            }
+            if self.reverb_running {
+                self.reverb_send += (self.user.reverb - self.reverb_send) * self.gain_step;
+                let [wl, wr] = self.reverb.process((frame[0] + frame[1]) * 0.5);
+                frame[0] += wl * self.reverb_send;
+                frame[1] += wr * self.reverb_send;
+            }
+            for s in frame.iter_mut() {
+                *s = soft_clip(*s * self.gain * MASTER_GAIN);
             }
             let level = frame[0].abs().max(frame[1].abs());
             self.peak = if level > self.peak { level } else { self.peak * self.peak_fall };
@@ -1243,6 +1284,45 @@ mod tests {
         rig.send(off(60));
         rig.run(2.0);
         assert_eq!(rig.active(), 2, "still ringing with the virtual pedal");
+    }
+
+    #[test]
+    fn reverb_adds_a_tail_and_bypasses_at_zero() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.send(on(69, 100));
+        rig.send(off(69));
+        rig.run(0.6);
+        assert_eq!(rig.active(), 0);
+        assert!(rig.rms(0.1) == 0.0, "dry: silence once the voice is gone");
+
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Reverb, 50)]);
+        rig.send(on(69, 100));
+        rig.send(off(69));
+        rig.run(0.6);
+        assert_eq!(rig.active(), 0);
+        assert!(rig.rms(0.1) > 1e-4, "reverb tail still audible after the note ended");
+
+        rig.set(&[]); // back to 0 %
+        rig.run(0.2);
+        assert!(!rig.engine.reverb_running);
+        assert_eq!(rig.rms(0.1), 0.0);
+    }
+
+    #[test]
+    fn samples_fade_out_at_their_end() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.send(on(69, 127));
+        let frames = rig.engine.inst.samples[0].frames;
+        // Jump close to the end of the 3 s sample.
+        rig.engine.voices.iter_mut().find(|v| v.active).unwrap().pos = (frames - 2400) as f64;
+        rig.run(0.005); // 240 frames in: 2160 left of a 6000-frame fade
+        let last = rig.buf.last().unwrap()[0].abs();
+        let v = rig.engine.voices.iter().find(|v| v.active).unwrap();
+        let g = v.gain[0] * v.env.level * 32767.0;
+        assert!(last <= g * 0.4, "fading near the end: {last} vs {g}");
+        rig.run(0.1);
+        assert_eq!(rig.active(), 0);
     }
 
     #[test]

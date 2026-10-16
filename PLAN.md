@@ -41,7 +41,9 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
    the note-on), Detune (live), Attack (added fade-in), Decay/Sustain (extra fade, off by default), Release
    (× instrument release), Low/High pass (12 dB/oct master filters, gliding), Velocity touch curve.
    Limiter is now transparent below -2 dBFS. Sustain = ring time after release (0.2-20 s) or virtual pedal at 100 %.
-5. **FX**: low-pass/cutoff, reverb, master gain + limiter.
+5. ✅ **Reverb**: 8-line FDN (pre-delay 20 ms, 4 diffusers, Householder feedback, per-line damping,
+   decorrelated stereo), ~2.2 s decay, Reverb cell = send level (100 % ≈ dry level), bypassed at 0.
+   Also: samples fade over their last 250 ms (held notes no longer cut off at the end of short recordings).
 6. **Profiles**: TOML files in `soundsprofiles/`, load/save/switch while playing.
 7. **Recording**: tap the master bus and write a WAV in a non-real-time thread (also write MIDI).
 8. **Bluetooth tuning**: PipeWire bluez5 latency settings, SBC-XQ, latency offset measurement.
