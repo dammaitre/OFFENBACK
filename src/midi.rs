@@ -35,13 +35,6 @@ impl MidiEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct TimedEvent {
-    /// Microseconds since the connection was opened (as reported by the backend).
-    pub micros: u64,
-    pub event: MidiEvent,
-}
-
 pub fn list_ports() -> Result<Vec<String>> {
     let input = MidiInput::new(CLIENT_NAME).context("cannot open the ALSA sequencer")?;
     Ok(input
@@ -55,7 +48,7 @@ pub fn list_ports() -> Result<Vec<String>> {
 /// `on_event` runs on midir's callback thread for every decoded event, so keep it short.
 pub fn connect<F>(query: &str, mut on_event: F) -> Result<(String, MidiInputConnection<()>)>
 where
-    F: FnMut(TimedEvent) + Send + 'static,
+    F: FnMut(MidiEvent) + Send + 'static,
 {
     let mut input = MidiInput::new(CLIENT_NAME).context("cannot open the ALSA sequencer")?;
     // Drop sysex, clock and active sensing: we only care about performance data.
@@ -77,9 +70,9 @@ where
         .connect(
             &port,
             "offenback-in",
-            move |micros, bytes, _| {
+            move |_, bytes, _| {
                 if let Some(event) = MidiEvent::parse(bytes) {
-                    on_event(TimedEvent { micros, event });
+                    on_event(event);
                 }
             },
             (),

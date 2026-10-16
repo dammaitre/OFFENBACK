@@ -2,12 +2,14 @@ mod audio;
 mod engine;
 mod instrument;
 mod midi;
+mod params;
 mod sfz;
 mod tui;
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 
 const USAGE: &str = "\
 OFFENBACK - terminal MIDI keyboard controller
@@ -69,8 +71,19 @@ fn main() -> Result<()> {
     if let Some(query) = port {
         app.connect(&query);
     }
+    app.ask_for_port_if_needed();
+
     let mut terminal = ratatui::init();
+    // Mouse reporting carries touchpad scrolling. Turn it off again even on panic, or the
+    // shell is left printing escape codes on every mouse move.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        hook(info);
+    }));
+    ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
     let result = app.run(&mut terminal);
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }

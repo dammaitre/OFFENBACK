@@ -62,8 +62,6 @@ pub struct AudioOut {
     _stream: cpal::Stream,
     pub device_name: String,
     pub sample_rate: u32,
-    /// What we asked for; `None` lets the server choose.
-    pub requested_buffer: Option<u32>,
 }
 
 /// Opens the first output whose id or name contains `query` (default output when `None`)
@@ -90,10 +88,10 @@ pub fn open(
                 .ok_or_else(|| anyhow!("no audio output matching \"{q}\""))?
         }
     };
-    let device_name = device
-        .description()
-        .map(|d| d.name().to_owned())
-        .unwrap_or_else(|_| "unknown".into());
+    let device_name = match device.id().map(|i| i.id().to_owned()).as_deref() {
+        Ok("output_default" | "sink_default") => "System default".to_owned(),
+        _ => device.description().map(|d| d.name().to_owned()).unwrap_or_else(|_| "unknown".into()),
+    };
 
     let supported = device.default_output_config().context("cannot query output config")?;
     let format = supported.sample_format();
@@ -122,7 +120,6 @@ pub fn open(
         _stream: stream,
         device_name,
         sample_rate: config.sample_rate,
-        requested_buffer: buffer,
     })
 }
 

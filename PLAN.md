@@ -34,6 +34,9 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
 3. ✅ **SFZ sampler**: SFZ parser (defines/includes/inheritance/curves), CC-modulated params, FLAC/WAV decoded to
    normalized i16 in RAM, Hermite interpolation, DAHDSR, filters, polyphony groups, release triggers, keyswitches,
    CC-triggered regions. Splendid: 245 MB, 0.6 s load. Salamander: 1.25 GB, 3.3 s load.
+3b. ✅ **UI redesign**: top bar (held/sustain lights, port, output), effects matrix (arrows select,
+   touchpad scroll adjusts), mini keyboard, popups for Port / Output (buffer, latency) / Instrument.
+   Parameters are not yet wired to sound.
 4. **Transform stage**: velocity curve (editable points), auto-sustain, CC64 passthrough, transpose, detune.
 5. **FX**: low-pass/cutoff, reverb, master gain + limiter.
 6. **Profiles**: TOML files in `soundsprofiles/`, load/save/switch while playing.
