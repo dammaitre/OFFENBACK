@@ -11,12 +11,14 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use midir::MidiInputConnection;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
 use crate::audio::{self, AudioOut, OutputInfo};
-use crate::engine::{EngineCmd, Stats};
+use crate::engine::{EngineCmd, Garbage, Layer, LayerId, LayerSpec, MAX_LAYERS, Stats};
 use crate::instrument::{self, Instrument, Progress};
 use crate::midi::{self, MidiEvent};
 use crate::params::{ParamId, Params};
@@ -55,9 +57,22 @@ enum Source {
 }
 
 struct Loading {
+    /// Layer that receives the instrument (if it still exists when loading ends).
+    layer: LayerId,
     name: String,
     progress: Arc<Progress>,
     handle: JoinHandle<Result<Instrument>>,
+}
+
+/// UI side of one layer; the engine holds the matching `engine::Layer`.
+struct LayerUi {
+    id: LayerId,
+    instrument: Arc<Instrument>,
+    source: Option<Source>,
+    params: Params,
+    /// What the engine has; `None` forces a resend.
+    params_sent: Option<Params>,
+    muted: bool,
 }
 
 pub struct App {
@@ -71,12 +86,19 @@ pub struct App {
     engine_tx: Sender<EngineCmd>,
     engine_rx: Receiver<EngineCmd>,
     stats: Arc<Stats>,
-    instrument: Arc<Instrument>,
-    instrument_source: Option<Source>,
+    layers: Vec<LayerUi>,
+    /// Index into `layers` of the layer shown in the matrix.
+    current: usize,
+    next_layer_id: LayerId,
+    /// First visible column of the layer bar, and where each column was drawn.
+    layer_scroll: usize,
+    layer_rects: Vec<(usize, Rect)>,
+    /// Instrument for Alt+N.
+    piano: Option<PathBuf>,
     loading: Option<Loading>,
-    /// Instruments the audio thread no longer uses; dropped here, off the real-time thread.
-    garbage_tx: Sender<Arc<Instrument>>,
-    garbage_rx: Receiver<Arc<Instrument>>,
+    /// Memory the audio thread is done with; dropped here, off the real-time thread.
+    garbage_tx: Sender<Garbage>,
+    garbage_rx: Receiver<Garbage>,
     instruments: Vec<Source>,
     instrument_list: ListState,
     audio: Option<AudioOut>,
@@ -88,9 +110,6 @@ pub struct App {
     /// Index into `BUFFER_SIZES`; `None` lets the server choose.
     buffer: Option<usize>,
     test_note_off: Option<Instant>,
-    params: Params,
-    /// What the engine has; `None` forces a resend (e.g. after reopening the stream).
-    params_sent: Option<Params>,
     /// Index into `ParamId::ALL`.
     selected: usize,
     /// First visible matrix column when the terminal is too narrow for all of them.
@@ -108,14 +127,24 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(output: Option<String>, buffer: Option<u32>, instrument: Option<PathBuf>) -> Self {
+    /// `instrument` is loaded into the first layer; `piano` is what Alt+N adds.
+    pub fn new(output: Option<String>, buffer: Option<u32>, instrument: Option<PathBuf>, piano: Option<PathBuf>) -> Self {
         let (ui_tx, ui_rx) = crossbeam_channel::bounded(4096);
         let (engine_tx, engine_rx) = crossbeam_channel::bounded(1024);
-        let (garbage_tx, garbage_rx) = crossbeam_channel::bounded(8);
+        let (garbage_tx, garbage_rx) = crossbeam_channel::bounded(16);
         // The server default is often 1024 frames (~43 ms on built-in speakers); ask for less.
         let buffer = Some(buffer.unwrap_or(DEFAULT_BUFFER)).map(|b| {
             BUFFER_SIZES.iter().position(|&s| s >= b).unwrap_or(BUFFER_SIZES.len() - 1)
         });
+        // Until an SFZ loads (or if none is installed), play the plain sine synth.
+        let first = LayerUi {
+            id: 0,
+            instrument: Arc::new(Instrument::synth(PRESETS[0].clone())),
+            source: Some(Source::Synth(0)),
+            params: Params::default(),
+            params_sent: None,
+            muted: false,
+        };
         let mut app = Self {
             popup: None,
             ports: Vec::new(),
@@ -126,9 +155,12 @@ impl App {
             engine_tx,
             engine_rx,
             stats: Arc::new(Stats::default()),
-            // Until an SFZ loads (or if none is installed), play the plain sine synth.
-            instrument: Arc::new(Instrument::synth(PRESETS[0].clone())),
-            instrument_source: Some(Source::Synth(0)),
+            layers: vec![first],
+            current: 0,
+            next_layer_id: 1,
+            layer_scroll: 0,
+            layer_rects: Vec::new(),
+            piano,
             loading: None,
             garbage_tx,
             garbage_rx,
@@ -141,8 +173,6 @@ impl App {
             output,
             buffer,
             test_note_off: None,
-            params: Params::default(),
-            params_sent: None,
             selected: 0,
             matrix_scroll: 0,
             cell_rects: Vec::new(),
@@ -156,7 +186,7 @@ impl App {
         app.refresh_ports();
         app.open_audio();
         if let Some(path) = instrument {
-            app.load_instrument(path);
+            app.load_instrument(path, 0);
         }
         app
     }
@@ -193,11 +223,7 @@ impl App {
         while !self.quit {
             self.drain_events();
             self.poll_loading();
-            if self.params_sent != Some(self.params)
-                && self.engine_tx.try_send(EngineCmd::Params(self.params)).is_ok()
-            {
-                self.params_sent = Some(self.params);
-            }
+            self.send_params();
             while self.garbage_rx.try_recv().is_ok() {}
             if self.rec_keepalive.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(1)) {
                 self.rec_keepalive = None;
@@ -211,7 +237,7 @@ impl App {
                 // Touchpads send scroll bursts: handle everything queued before redrawing.
                 loop {
                     match event::read()? {
-                        Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key.code),
+                        Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
                         Event::Mouse(m) => self.on_mouse(m),
                         _ => {}
                     }
@@ -226,6 +252,165 @@ impl App {
         }
         Ok(())
     }
+
+    // --- Layers -------------------------------------------------------------------------
+
+    fn layer(&self) -> &LayerUi {
+        &self.layers[self.current]
+    }
+
+    fn layer_mut(&mut self) -> &mut LayerUi {
+        &mut self.layers[self.current]
+    }
+
+    fn layer_index(&self, id: LayerId) -> Option<usize> {
+        self.layers.iter().position(|l| l.id == id)
+    }
+
+    fn send_params(&mut self) {
+        for l in &mut self.layers {
+            if l.params_sent != Some(l.params) && self.engine_tx.try_send(EngineCmd::Params(l.id, l.params)).is_ok() {
+                l.params_sent = Some(l.params);
+            }
+        }
+    }
+
+    /// Adds a layer right after the current one and selects it.
+    fn add_layer(&mut self, instrument: Arc<Instrument>, source: Option<Source>, params: Params) -> Option<LayerId> {
+        if self.layers.len() >= MAX_LAYERS {
+            self.status = format!("at most {MAX_LAYERS} layers");
+            return None;
+        }
+        let id = self.next_layer_id;
+        self.next_layer_id += 1;
+        // Built here, with all its memory, so the audio thread only has to plug it in.
+        let layer = Layer::new(id, self.sample_rate(), instrument.clone(), &params, false);
+        let _ = self.engine_tx.send(EngineCmd::AddLayer(layer));
+        self.current = (self.current + 1).min(self.layers.len());
+        self.layers.insert(
+            self.current,
+            LayerUi { id, instrument, source, params, params_sent: Some(params), muted: false },
+        );
+        Some(id)
+    }
+
+    fn duplicate_layer(&mut self) {
+        let l = self.layer();
+        let (inst, source, params) = (l.instrument.clone(), l.source.clone(), l.params);
+        if self.add_layer(inst, source, params).is_some() {
+            self.status = format!("layer {} duplicated", self.current);
+        }
+    }
+
+    fn new_piano_layer(&mut self) {
+        let Some(path) = self.piano.clone() else {
+            // No piano installed: a fresh sine synth layer instead.
+            let inst = Arc::new(Instrument::synth(PRESETS[0].clone()));
+            self.add_layer(inst, Some(Source::Synth(0)), Params::default());
+            return;
+        };
+        if self.loading.is_some() && self.shared_instrument(&path).is_none() {
+            self.status = "wait for the current instrument to finish loading".into();
+            return;
+        }
+        let name = path.file_stem().map_or("piano".into(), |s| s.to_string_lossy().into_owned());
+        let placeholder = Arc::new(Instrument::empty(name));
+        if let Some(id) = self.add_layer(placeholder, Some(Source::Sfz(path.clone())), Params::default()) {
+            self.load_instrument(path, id);
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        let l = self.layer_mut();
+        l.muted = !l.muted;
+        let (id, muted) = (l.id, l.muted);
+        let _ = self.engine_tx.send(EngineCmd::Mute(id, muted));
+        self.status = format!("layer {} {}", self.current + 1, if muted { "muted" } else { "unmuted" });
+    }
+
+    fn kill_layer(&mut self) {
+        if self.layers.len() == 1 {
+            self.status = "the last layer can't be removed".into();
+            return;
+        }
+        let l = self.layers.remove(self.current);
+        let _ = self.engine_tx.send(EngineCmd::RemoveLayer(l.id));
+        self.status = format!("removed layer {} ({})", self.current + 1, l.instrument.name);
+        self.current = self.current.min(self.layers.len() - 1);
+    }
+
+    /// An already loaded copy of this SFZ in another layer, to share instead of reloading.
+    fn shared_instrument(&self, path: &Path) -> Option<Arc<Instrument>> {
+        self.layers
+            .iter()
+            .find(|l| l.source.as_ref() == Some(&Source::Sfz(path.to_owned())) && !l.instrument.regions.is_empty())
+            .map(|l| l.instrument.clone())
+    }
+
+    fn set_layer_instrument(&mut self, id: LayerId, instrument: Arc<Instrument>, source: Option<Source>) {
+        let Some(i) = self.layer_index(id) else { return };
+        let _ = self.engine_tx.send(EngineCmd::SetInstrument(id, instrument.clone()));
+        self.layers[i].instrument = instrument;
+        self.layers[i].source = source;
+    }
+
+    fn select_instrument(&mut self, source: Source) {
+        let id = self.layer().id;
+        match source {
+            Source::Synth(i) => {
+                let inst = Arc::new(Instrument::synth(PRESETS[i].clone()));
+                self.status = format!("{} ready", inst.name);
+                self.set_layer_instrument(id, inst, Some(source));
+            }
+            Source::Sfz(path) => self.load_instrument(path, id),
+        }
+    }
+
+    /// Loads an SFZ into layer `id`, sharing it if another layer already has it.
+    fn load_instrument(&mut self, path: PathBuf, id: LayerId) {
+        if let Some(inst) = self.shared_instrument(&path) {
+            self.status = format!("{} shared with another layer", inst.name);
+            self.set_layer_instrument(id, inst, Some(Source::Sfz(path)));
+            return;
+        }
+        if self.loading.is_some() {
+            self.status = "wait for the current instrument to finish loading".into();
+            return;
+        }
+        let progress = Arc::new(Progress::default());
+        let name = path.file_stem().map_or("instrument".into(), |s| s.to_string_lossy().into_owned());
+        let p = progress.clone();
+        let load_path = path.clone();
+        let handle = std::thread::spawn(move || instrument::load_sfz(&load_path, &p));
+        self.status = format!("loading {name}…");
+        if let Some(i) = self.layer_index(id) {
+            self.layers[i].source = Some(Source::Sfz(path));
+        }
+        self.loading = Some(Loading { layer: id, name, progress, handle });
+    }
+
+    fn poll_loading(&mut self) {
+        if !self.loading.as_ref().is_some_and(|l| l.handle.is_finished()) {
+            return;
+        }
+        let Some(loading) = self.loading.take() else { return };
+        match loading.handle.join() {
+            Ok(Ok(inst)) => {
+                self.status = format!(
+                    "{} loaded: {} regions, {} MB",
+                    inst.name,
+                    inst.regions.len(),
+                    inst.memory_bytes() >> 20
+                );
+                let source = self.layer_index(loading.layer).and_then(|i| self.layers[i].source.clone());
+                self.set_layer_instrument(loading.layer, Arc::new(inst), source);
+            }
+            Ok(Err(e)) => self.status = format!("cannot load {}: {e:#}", loading.name),
+            Err(_) => self.status = format!("loading {} crashed", loading.name),
+        }
+    }
+
+    // --- Audio, recording ---------------------------------------------------------------
 
     fn sample_rate(&self) -> u32 {
         self.audio.as_ref().map_or(48_000, |a| a.sample_rate)
@@ -266,51 +451,6 @@ impl App {
         }
     }
 
-    fn select_instrument(&mut self, source: Source) {
-        match source {
-            Source::Synth(i) => {
-                self.loading = None;
-                self.instrument = Arc::new(Instrument::synth(PRESETS[i].clone()));
-                let _ = self.engine_tx.try_send(EngineCmd::SetInstrument(self.instrument.clone()));
-                self.status = format!("{} ready", self.instrument.name);
-                self.instrument_source = Some(source);
-            }
-            Source::Sfz(path) => self.load_instrument(path),
-        }
-    }
-
-    fn load_instrument(&mut self, path: PathBuf) {
-        let progress = Arc::new(Progress::default());
-        let name = path.file_stem().map_or("instrument".into(), |s| s.to_string_lossy().into_owned());
-        let p = progress.clone();
-        let load_path = path.clone();
-        let handle = std::thread::spawn(move || instrument::load_sfz(&load_path, &p));
-        self.status = format!("loading {name}…");
-        self.instrument_source = Some(Source::Sfz(path));
-        self.loading = Some(Loading { name, progress, handle });
-    }
-
-    fn poll_loading(&mut self) {
-        if !self.loading.as_ref().is_some_and(|l| l.handle.is_finished()) {
-            return;
-        }
-        let Some(loading) = self.loading.take() else { return };
-        match loading.handle.join() {
-            Ok(Ok(inst)) => {
-                self.status = format!(
-                    "{} loaded: {} regions, {} MB",
-                    inst.name,
-                    inst.regions.len(),
-                    inst.memory_bytes() >> 20
-                );
-                self.instrument = Arc::new(inst);
-                let _ = self.engine_tx.try_send(EngineCmd::SetInstrument(self.instrument.clone()));
-            }
-            Ok(Err(e)) => self.status = format!("cannot load {}: {e:#}", loading.name),
-            Err(_) => self.status = format!("loading {} crashed", loading.name),
-        }
-    }
-
     fn buffer_frames(&self) -> Option<u32> {
         self.buffer.map(|i| BUFFER_SIZES[i])
     }
@@ -320,17 +460,24 @@ impl App {
         self.audio = None;
         while self.engine_rx.try_recv().is_ok() {}
         self.stats.reset_latency();
+        let specs: Vec<LayerSpec> = self
+            .layers
+            .iter()
+            .map(|l| LayerSpec { id: l.id, instrument: l.instrument.clone(), params: l.params, muted: l.muted })
+            .collect();
         let result = audio::open(
             self.output.as_deref(),
             self.buffer_frames(),
-            self.instrument.clone(),
+            &specs,
             self.engine_rx.clone(),
             self.garbage_tx.clone(),
             self.stats.clone(),
         );
         match result {
             Ok(out) => {
-                self.params_sent = None;
+                for l in &mut self.layers {
+                    l.params_sent = Some(l.params);
+                }
                 // A new engine starts without the recorder.
                 if let Some(rec) = &self.recording {
                     let _ = self.engine_tx.try_send(EngineCmd::Record(Some(rec.sender())));
@@ -346,6 +493,8 @@ impl App {
     fn send_engine(&self, event: MidiEvent) {
         let _ = self.engine_tx.try_send(EngineCmd::Midi { event, at: Instant::now() });
     }
+
+    // --- Popups -------------------------------------------------------------------------
 
     fn refresh_ports(&mut self) {
         match midi::list_ports() {
@@ -383,7 +532,8 @@ impl App {
             .chain(find_sfz_files().into_iter().map(Source::Sfz))
             .collect();
         let current = self
-            .instrument_source
+            .layer()
+            .source
             .as_ref()
             .and_then(|c| self.instruments.iter().position(|i| i == c));
         self.instrument_list.select(current.or((!self.instruments.is_empty()).then_some(0)));
@@ -397,6 +547,16 @@ impl App {
         }
         self.popup = Some(popup);
     }
+
+    fn popup_list(&mut self) -> Option<&mut ListState> {
+        match self.popup? {
+            Popup::Port => Some(&mut self.port_list),
+            Popup::Output => Some(&mut self.output_list),
+            Popup::Instrument => Some(&mut self.instrument_list),
+        }
+    }
+
+    // --- Input --------------------------------------------------------------------------
 
     fn drain_events(&mut self) {
         for (event, at) in self.ui_rx.try_iter() {
@@ -412,26 +572,30 @@ impl App {
         }
     }
 
-    fn popup_list(&mut self) -> Option<&mut ListState> {
-        match self.popup? {
-            Popup::Port => Some(&mut self.port_list),
-            Popup::Output => Some(&mut self.output_list),
-            Popup::Instrument => Some(&mut self.instrument_list),
-        }
-    }
-
-    fn on_key(&mut self, code: KeyCode) {
+    fn on_key(&mut self, key: KeyEvent) {
         if let Some(popup) = self.popup {
-            self.on_popup_key(popup, code);
+            self.on_popup_key(popup, key.code);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Enter => self.open_popup(Popup::Instrument),
+                KeyCode::Char('d' | 'D') => self.duplicate_layer(),
+                KeyCode::Char('n' | 'N') => self.new_piano_layer(),
+                KeyCode::Char('m' | 'M') => self.toggle_mute(),
+                KeyCode::Char('k' | 'K') => self.kill_layer(),
+                KeyCode::Left => self.current = self.current.saturating_sub(1),
+                KeyCode::Right => self.current = (self.current + 1).min(self.layers.len() - 1),
+                _ => {}
+            }
             return;
         }
         let selected = ParamId::ALL[self.selected];
         let count = ParamId::ALL.len();
-        match code {
+        match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('o') => self.open_popup(Popup::Output),
             KeyCode::Char('p') => self.open_popup(Popup::Port),
-            KeyCode::Char('i') => self.open_popup(Popup::Instrument),
             KeyCode::Char('r' | 'R') => self.toggle_recording(),
             KeyCode::Left => self.selected = self.selected.saturating_sub(1),
             KeyCode::Right => self.selected = (self.selected + 1).min(count - 1),
@@ -446,7 +610,7 @@ impl App {
             KeyCode::PageDown => self.edit(selected, -COARSE_STEPS),
             KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => {
                 if self.is_enabled(selected) {
-                    self.params.reset(selected);
+                    self.layer_mut().params.reset(selected);
                 }
             }
             _ => {}
@@ -503,10 +667,8 @@ impl App {
             }
             Popup::Instrument => {
                 if let Some(source) = self.instrument_list.selected().and_then(|i| self.instruments.get(i)).cloned() {
-                    if self.loading.is_none() {
-                        self.select_instrument(source);
-                        self.popup = None;
-                    }
+                    self.select_instrument(source);
+                    self.popup = None;
                 }
             }
         }
@@ -520,6 +682,8 @@ impl App {
                 let pos = Position::new(m.column, m.row);
                 if let Some(&(i, _)) = self.cell_rects.iter().find(|(_, r)| r.contains(pos)) {
                     self.selected = i;
+                } else if let Some(&(i, _)) = self.layer_rects.iter().find(|(_, r)| r.contains(pos)) {
+                    self.current = i;
                 }
                 return;
             }
@@ -535,14 +699,14 @@ impl App {
 
     /// Envelope and LFO cells only do something on synths.
     fn is_enabled(&self, id: ParamId) -> bool {
-        !id.synth_only() || self.instrument.synth.is_some()
+        !id.synth_only() || self.layer().instrument.synth.is_some()
     }
 
     fn edit(&mut self, id: ParamId, steps: i32) {
         if self.is_enabled(id) {
-            self.params.nudge(id, steps);
+            self.layer_mut().params.nudge(id, steps);
         } else {
-            self.status = format!("{} only applies to synths (choose one with i)", id.spec().name);
+            self.status = format!("{} only applies to synths (Alt+Enter to choose one)", id.spec().name);
         }
     }
 }

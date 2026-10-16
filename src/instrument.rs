@@ -246,6 +246,11 @@ pub struct Instrument {
 }
 
 impl Instrument {
+    /// A silent placeholder (e.g. while the real instrument loads).
+    pub fn empty(name: String) -> Self {
+        Self { name, synth: None, ..Self::synth(crate::synth::PRESETS[0].clone()) }
+    }
+
     pub fn synth(patch: SynthPatch) -> Self {
         Self {
             name: format!("Synth · {}", patch.name),

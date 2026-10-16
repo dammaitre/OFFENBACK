@@ -1,4 +1,6 @@
-//! Real-time engine (sampler and synth voices), run inside the audio callback.
+//! Real-time engine, run inside the audio callback. The `Engine` mixes up to `MAX_LAYERS`
+//! `Layer`s (each an instrument with its own voices and matrix settings) into a shared
+//! reverb, limiter and recorder.
 //!
 //! Rules: no allocation, no locks, no syscalls besides `Instant::now()`. Commands arrive
 //! through a bounded lock-free channel and statistics leave through atomics. Replaced
@@ -37,13 +39,36 @@ const FILTER_UPDATE_FRAMES: usize = 32;
 /// Notes starting this close together are a chord: they don't glide from one another.
 const GLIDE_CHORD_S: f32 = 0.03;
 
+pub const MAX_LAYERS: usize = 8;
+
+/// Identifies a layer across the UI and the audio thread.
+pub type LayerId = u32;
+
 pub enum EngineCmd {
     /// `at` is when the event reached us, for latency measurement.
     Midi { event: MidiEvent, at: Instant },
-    SetInstrument(Arc<Instrument>),
-    Params(Params),
+    /// Built on the UI thread so the audio thread never allocates.
+    AddLayer(Box<Layer>),
+    RemoveLayer(LayerId),
+    SetInstrument(LayerId, Arc<Instrument>),
+    Params(LayerId, Params),
+    Mute(LayerId, bool),
     /// Start (`Some`) or stop (`None`) copying the master output to a recorder.
     Record(Option<Sender<RecMsg>>),
+}
+
+/// What the UI asks a new audio stream to build its layers from.
+pub struct LayerSpec {
+    pub id: LayerId,
+    pub instrument: Arc<Instrument>,
+    pub params: Params,
+    pub muted: bool,
+}
+
+/// Memory the audio thread is done with, to be freed on the UI thread.
+pub enum Garbage {
+    Instrument(#[allow(dead_code)] Arc<Instrument>),
+    Layer(#[allow(dead_code)] Box<Layer>),
 }
 
 /// The effects matrix, converted to what the audio thread needs.
@@ -383,7 +408,10 @@ impl Voice {
     };
 }
 
-pub struct Engine {
+/// One instrument with its voices, controllers and matrix settings.
+pub struct Layer {
+    id: LayerId,
+    muted: bool,
     sr: f32,
     inst: Arc<Instrument>,
     voices: Vec<Voice>,
@@ -402,11 +430,8 @@ pub struct Engine {
     low_pass_hz: f32,
     low_pass_res: f32,
     high_pass_hz: f32,
-    reverb: Reverb,
-    /// Smoothed reverb send; the reverb is bypassed (and cleared) once it reaches 0.
+    /// Smoothed send into the shared reverb.
     reverb_send: f32,
-    reverb_running: bool,
-    recorder: Option<Sender<RecMsg>>,
     sw_last: Option<u8>,
     /// Sounding note for each held input key (input key + transpose at note-on time).
     key_map: [Option<u8>; 128],
@@ -419,30 +444,39 @@ pub struct Engine {
     clock: u64,
     voice_counter: u64,
     rng: u32,
+    /// The layer's own mix, before volume and filters.
+    scratch: Box<[[f32; 2]; BLOCK_FRAMES]>,
+}
+
+/// Mixes the layers; owns everything shared.
+pub struct Engine {
+    layers: Vec<Box<Layer>>,
+    reverb: Reverb,
+    /// Mono reverb input, summed from every layer's send.
+    send: Box<[f32; BLOCK_FRAMES]>,
+    reverb_running: bool,
+    recorder: Option<Sender<RecMsg>>,
     peak: f32,
     peak_fall: f32,
     cmds: Receiver<EngineCmd>,
-    garbage: Sender<Arc<Instrument>>,
+    garbage: Sender<Garbage>,
     stats: Arc<Stats>,
 }
 
-impl Engine {
-    pub fn new(
-        sample_rate: u32,
-        inst: Arc<Instrument>,
-        cmds: Receiver<EngineCmd>,
-        garbage: Sender<Arc<Instrument>>,
-        stats: Arc<Stats>,
-    ) -> Self {
+impl Layer {
+    /// Allocates everything the layer will ever need. Call off the audio thread.
+    pub fn new(id: LayerId, sample_rate: u32, inst: Arc<Instrument>, params: &Params, muted: bool) -> Box<Self> {
         let sr = sample_rate as f32;
-        Self {
+        Box::new(Self {
+            id,
+            muted,
             sr,
             ccs: inst.cc_defaults,
             sw_last: inst.sw_default,
             inst,
             voices: vec![Voice::IDLE; MAX_VOICES],
             bend: 1.0,
-            user: User::new(&Params::default()),
+            user: User::new(params),
             lfo_phase: 0.0,
             last_synth_note: None,
             gain: 1.0,
@@ -452,10 +486,7 @@ impl Engine {
             low_pass_hz: 20_000.0,
             low_pass_res: 0.0,
             high_pass_hz: 20.0,
-            reverb: Reverb::new(sr),
             reverb_send: 0.0,
-            reverb_running: false,
-            recorder: None,
             key_map: [None; 128],
             key_vel: [0; 128],
             key_time: [0; 128],
@@ -463,13 +494,48 @@ impl Engine {
             release_pending: [false; 128],
             clock: 0,
             voice_counter: 0,
-            rng: 0x9E37_79B9,
+            rng: 0x9E37_79B9 ^ id.wrapping_mul(0x85EB_CA6B),
+            scratch: Box::new([[0.0; 2]; BLOCK_FRAMES]),
+        })
+    }
+
+    fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        if muted {
+            for v in &mut self.voices {
+                v.active = false;
+            }
+        }
+    }
+}
+
+impl Engine {
+    pub fn new(
+        sample_rate: u32,
+        layers: Vec<Box<Layer>>,
+        cmds: Receiver<EngineCmd>,
+        garbage: Sender<Garbage>,
+        stats: Arc<Stats>,
+    ) -> Self {
+        let sr = sample_rate as f32;
+        let mut all = Vec::with_capacity(MAX_LAYERS);
+        all.extend(layers.into_iter().take(MAX_LAYERS));
+        Self {
+            layers: all,
+            reverb: Reverb::new(sr),
+            send: Box::new([0.0; BLOCK_FRAMES]),
+            reverb_running: false,
+            recorder: None,
             peak: 0.0,
             peak_fall: exp_coef(2.0, sr),
             cmds,
             garbage,
             stats,
         }
+    }
+
+    fn layer_mut(&mut self, id: LayerId) -> Option<&mut Layer> {
+        self.layers.iter_mut().find(|l| l.id == id).map(|l| &mut **l)
     }
 
     /// Called once at the start of every audio callback, before rendering.
@@ -485,10 +551,40 @@ impl Engine {
                         self.stats.note_latency_us.store(total, Relaxed);
                         self.stats.note_latency_max_us.fetch_max(total, Relaxed);
                     }
-                    self.handle(event);
+                    for layer in &mut self.layers {
+                        layer.handle(event);
+                    }
                 }
-                EngineCmd::SetInstrument(inst) => self.set_instrument(inst),
-                EngineCmd::Params(p) => self.user = User::new(&p),
+                EngineCmd::AddLayer(layer) => {
+                    // Capacity is reserved, so this never reallocates.
+                    if self.layers.len() < MAX_LAYERS {
+                        self.layers.push(layer);
+                    } else {
+                        let _ = self.garbage.try_send(Garbage::Layer(layer));
+                    }
+                }
+                EngineCmd::RemoveLayer(id) => {
+                    if let Some(i) = self.layers.iter().position(|l| l.id == id) {
+                        let layer = self.layers.remove(i);
+                        let _ = self.garbage.try_send(Garbage::Layer(layer));
+                    }
+                }
+                EngineCmd::SetInstrument(id, inst) => {
+                    if let Some(old) = self.layer_mut(id).map(|l| l.set_instrument(inst)) {
+                        // If the UI side is gone or the queue is full we drop it here; rare and harmless.
+                        let _ = self.garbage.try_send(Garbage::Instrument(old));
+                    }
+                }
+                EngineCmd::Params(id, p) => {
+                    if let Some(l) = self.layer_mut(id) {
+                        l.user = User::new(&p);
+                    }
+                }
+                EngineCmd::Mute(id, muted) => {
+                    if let Some(l) = self.layer_mut(id) {
+                        l.set_muted(muted);
+                    }
+                }
                 // The UI keeps its own sender, so dropping ours never wakes a thread from here.
                 EngineCmd::Record(tx) => self.recorder = tx,
             }
@@ -498,19 +594,69 @@ impl Engine {
         self.stats.callbacks.fetch_add(1, Relaxed);
     }
 
-    fn set_instrument(&mut self, inst: Arc<Instrument>) {
+    /// Fills `out` with stereo frames: every layer, shared reverb, limiter.
+    pub fn render(&mut self, out: &mut [[f32; 2]]) {
+        let n = out.len().min(BLOCK_FRAMES);
+        let out = &mut out[..n];
+        out.fill([0.0; 2]);
+        let send = &mut self.send[..n];
+        send.fill(0.0);
+        let mut active = 0;
+        let mut reverb_wanted = false;
+        let mut sending = false;
+        for layer in &mut self.layers {
+            active += layer.render(out, send);
+            reverb_wanted |= !layer.muted && layer.user.reverb > 0.0;
+            sending |= layer.reverb_send >= 1e-4;
+        }
+        if reverb_wanted {
+            self.reverb_running = true;
+        } else if self.reverb_running && !sending {
+            // Fully faded out: stop processing, and drop the old tail so it can't come back.
+            self.reverb_running = false;
+            self.reverb.clear();
+        }
+        for (frame, &x) in out.iter_mut().zip(send.iter()) {
+            if self.reverb_running {
+                let [wl, wr] = self.reverb.process(x);
+                frame[0] += wl;
+                frame[1] += wr;
+            }
+            for s in frame.iter_mut() {
+                *s = soft_clip(*s * MASTER_GAIN);
+            }
+            let level = frame[0].abs().max(frame[1].abs());
+            self.peak = if level > self.peak { level } else { self.peak * self.peak_fall };
+        }
+        if let Some(tx) = &self.recorder {
+            let mut block = AudioBlock { len: n, frames: [[0.0; 2]; BLOCK_FRAMES] };
+            block.frames[..n].copy_from_slice(out);
+            if tx.try_send(RecMsg::Audio(block)).is_err() {
+                self.stats.rec_dropped.fetch_add(1, Relaxed);
+            }
+        }
+        self.stats.active_voices.store(active, Relaxed);
+        self.stats.peak.store(self.peak.to_bits(), Relaxed);
+    }
+}
+
+impl Layer {
+    /// Swaps the instrument; returns the old one for the caller to dispose of.
+    fn set_instrument(&mut self, inst: Arc<Instrument>) -> Arc<Instrument> {
         for v in &mut self.voices {
             v.active = false;
         }
         self.ccs = inst.cc_defaults;
         self.sw_last = inst.sw_default;
         self.release_pending = [false; 128];
-        let old = std::mem::replace(&mut self.inst, inst);
-        // If the UI side is gone or the queue is full we drop it here; rare and harmless.
-        let _ = self.garbage.try_send(old);
+        std::mem::replace(&mut self.inst, inst)
     }
 
     fn handle(&mut self, event: MidiEvent) {
+        // A muted layer still tracks controllers and releases, so unmuting is seamless.
+        if self.muted && matches!(event, MidiEvent::NoteOn { .. }) {
+            return;
+        }
         match event {
             MidiEvent::NoteOn { note, vel, .. } => self.note_on(note, vel),
             MidiEvent::NoteOff { note, .. } => self.note_off(note),
@@ -867,14 +1013,20 @@ impl Engine {
         });
     }
 
-    /// Fills `out` with stereo frames.
-    pub fn render(&mut self, out: &mut [[f32; 2]]) {
-        out.fill([0.0; 2]);
-        self.update_master_filters(out.len());
+    /// Adds this layer's sound to `out` and its reverb send to `send`; returns active voices.
+    fn render(&mut self, out: &mut [[f32; 2]], send: &mut [f32]) -> u32 {
+        let n = out.len();
+        self.clock += n as u64;
+        if self.muted {
+            return 0;
+        }
+        self.update_master_filters(n);
+        let mix = &mut self.scratch[..n];
+        mix.fill([0.0; 2]);
         let inst = &*self.inst;
         let bend = (self.bend * self.user.detune) as f64;
         // Vibrato for synth voices, updated once per block.
-        self.lfo_phase = (self.lfo_phase + out.len() as f32 * self.user.lfo_rate / self.sr).fract();
+        self.lfo_phase = (self.lfo_phase + n as f32 * self.user.lfo_rate / self.sr).fract();
         let vibrato = 2f64.powf((self.user.lfo_cents * (self.lfo_phase * std::f32::consts::TAU).sin()) as f64 / 1200.0);
         // Unison layout of the current synth patch: pitch ratio and L/R gains per oscillator.
         let mut unison = [(1.0f64, 1.0f32, 1.0f32); MAX_UNISON];
@@ -895,14 +1047,14 @@ impl Engine {
         for v in self.voices.iter_mut().filter(|v| v.active) {
             if v.synth {
                 let step = v.step * bend * vibrato;
-                for (n, frame) in out.iter_mut().enumerate() {
+                for (k_frame, frame) in mix.iter_mut().enumerate() {
                     let e = v.env.next();
                     if v.env.stage == Stage::Done {
                         v.active = false;
                         break;
                     }
                     let fe = v.fenv.next();
-                    if filter_on && n % FILTER_UPDATE_FRAMES == 0 {
+                    if filter_on && k_frame % FILTER_UPDATE_FRAMES == 0 {
                         let cutoff = self.low_pass_hz * 2f32.powf(self.user.filter_env_oct * fe);
                         if let Some(f) = v.filter.as_mut() {
                             f.set(FilterKind::Lpf2p, cutoff, self.low_pass_res, self.sr);
@@ -939,7 +1091,7 @@ impl Engine {
             let s = &inst.samples[inst.regions[v.region as usize].sample];
             let d = &s.data;
             let step = v.step * bend;
-            for frame in out.iter_mut() {
+            for frame in mix.iter_mut() {
                 let e = v.env.next();
                 let i = v.pos as usize;
                 if v.env.stage == Stage::Done || i >= s.frames {
@@ -975,54 +1127,29 @@ impl Engine {
             }
         }
 
+        // Layer output: filters, volume, then into the mix and the reverb send.
         let lp_on = self.inst.synth.is_none() && self.low_pass_hz < LOW_PASS_OFF_HZ;
         let hp_on = self.high_pass_hz > HIGH_PASS_OFF_HZ;
-        let reverb_wanted = self.user.reverb > 0.0;
-        if reverb_wanted {
-            self.reverb_running = true;
-        } else if self.reverb_running && self.reverb_send < 1e-4 {
-            // Fully faded out: stop processing, and drop the old tail so it can't come back.
-            self.reverb_running = false;
-            self.reverb_send = 0.0;
-            self.reverb.clear();
-        }
-        for frame in out.iter_mut() {
+        for ((frame, dst), s) in mix.iter_mut().zip(out.iter_mut()).zip(send.iter_mut()) {
             self.gain += (self.user.gain - self.gain) * self.gain_step;
-            for (c, s) in frame.iter_mut().enumerate() {
+            self.reverb_send += (self.user.reverb - self.reverb_send) * self.gain_step;
+            for (c, x) in frame.iter_mut().enumerate() {
                 if lp_on {
-                    *s = self.low_pass.process(c, *s);
+                    *x = self.low_pass.process(c, *x);
                 }
                 if hp_on {
-                    *s = self.high_pass.process(c, *s);
+                    *x = self.high_pass.process(c, *x);
                 }
+                *x *= self.gain;
             }
-            if self.reverb_running {
-                self.reverb_send += (self.user.reverb - self.reverb_send) * self.gain_step;
-                let [wl, wr] = self.reverb.process((frame[0] + frame[1]) * 0.5);
-                frame[0] += wl * self.reverb_send;
-                frame[1] += wr * self.reverb_send;
-            }
-            for s in frame.iter_mut() {
-                *s = soft_clip(*s * self.gain * MASTER_GAIN);
-            }
-            let level = frame[0].abs().max(frame[1].abs());
-            self.peak = if level > self.peak { level } else { self.peak * self.peak_fall };
+            dst[0] += frame[0];
+            dst[1] += frame[1];
+            *s += (frame[0] + frame[1]) * 0.5 * self.reverb_send;
         }
-        if let Some(tx) = &self.recorder {
-            let mut block = AudioBlock { len: out.len().min(BLOCK_FRAMES), frames: [[0.0; 2]; BLOCK_FRAMES] };
-            block.frames[..block.len].copy_from_slice(&out[..block.len]);
-            if tx.try_send(RecMsg::Audio(block)).is_err() {
-                self.stats.rec_dropped.fetch_add(1, Relaxed);
-            }
-        }
-        self.clock += out.len() as u64;
-        self.stats.active_voices.store(active, Relaxed);
-        self.stats.peak.store(self.peak.to_bits(), Relaxed);
+        active
     }
-}
 
-impl Engine {
-    /// Glides the master filter cutoffs towards their targets (~30 ms, log domain).
+    /// Glides the layer filter cutoffs towards their targets (~30 ms, log domain).
     fn update_master_filters(&mut self, frames: usize) {
         let k = 1.0 - (-(frames as f32) / (0.03 * self.sr)).exp();
         let glide = |current: &mut f32, target: f32| -> bool {
@@ -1079,8 +1206,17 @@ mod tests {
         fn new(inst: Instrument) -> Self {
             let (tx, rx) = crossbeam_channel::bounded(256);
             let (gtx, _grx) = crossbeam_channel::bounded(4);
-            let engine = Engine::new(SR, Arc::new(inst), rx, gtx, Arc::new(Stats::default()));
+            let layer = Layer::new(0, SR, Arc::new(inst), &Params::default(), false);
+            let engine = Engine::new(SR, vec![layer], rx, gtx, Arc::new(Stats::default()));
             Self { engine, tx, buf: vec![[0.0; 2]; 256] }
+        }
+
+        fn layer(&self) -> &Layer {
+            &self.engine.layers[0]
+        }
+
+        fn layer_mut(&mut self) -> &mut Layer {
+            &mut self.engine.layers[0]
         }
 
         fn send(&mut self, event: MidiEvent) {
@@ -1099,7 +1235,7 @@ mod tests {
         }
 
         fn active(&self) -> usize {
-            self.engine.voices.iter().filter(|v| v.active).count()
+            self.layer().voices.iter().filter(|v| v.active).count()
         }
 
         fn set(&mut self, edits: &[(ParamId, i32)]) {
@@ -1107,7 +1243,7 @@ mod tests {
             for &(id, steps) in edits {
                 p.nudge(id, steps);
             }
-            self.tx.send(EngineCmd::Params(p)).unwrap();
+            self.tx.send(EngineCmd::Params(0, p)).unwrap();
             self.engine.begin_callback(self.buf.len(), 0);
         }
 
@@ -1163,7 +1299,7 @@ mod tests {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
         rig.send(on(69, 100));
         rig.send(on(81, 100));
-        let steps: Vec<f64> = rig.engine.voices.iter().filter(|v| v.active).map(|v| v.step).collect();
+        let steps: Vec<f64> = rig.layer().voices.iter().filter(|v| v.active).map(|v| v.step).collect();
         assert!((steps[0] - 1.0).abs() < 1e-9 && (steps[1] - 2.0).abs() < 1e-9, "{steps:?}");
     }
 
@@ -1172,7 +1308,7 @@ mod tests {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
         rig.send(on(60, 127));
         rig.send(on(62, 64));
-        let g: Vec<f32> = rig.engine.voices.iter().filter(|v| v.active).map(|v| v.gain[0]).collect();
+        let g: Vec<f32> = rig.layer().voices.iter().filter(|v| v.active).map(|v| v.gain[0]).collect();
         let ratio = g[1] / g[0];
         assert!((ratio - (64.0f32 / 127.0).powi(2)).abs() < 1e-3, "{ratio}");
     }
@@ -1186,7 +1322,7 @@ mod tests {
         rig.send(on(60, 100));
         rig.send(on(60, 100));
         assert_eq!(rig.active(), 2);
-        assert_eq!(rig.engine.voices.iter().filter(|v| v.offed).count(), 1);
+        assert_eq!(rig.layer().voices.iter().filter(|v| v.offed).count(), 1);
         rig.run(0.3);
         assert_eq!(rig.active(), 1);
     }
@@ -1208,7 +1344,7 @@ mod tests {
         rig.send(on(60, 100));
         rig.run(0.5);
         rig.send(off(60));
-        let rel_voice = rig.engine.voices.iter().find(|v| v.active && v.trigger == Trigger::Release).unwrap();
+        let rel_voice = rig.layer().voices.iter().find(|v| v.active && v.trigger == Trigger::Release).unwrap();
         let attack_gain = (100.0f32 / 127.0).powi(2) * db_to_gain(-6.0) / 32767.0;
         // Held ~0.5 s at 20 dB/s → about -10 dB.
         let db = 20.0 * (rel_voice.gain[0] / attack_gain).log10();
@@ -1226,7 +1362,7 @@ mod tests {
         rig.send(cc(64, 127));
         rig.send(on(60, 100));
         rig.send(off(60));
-        let releases = |r: &Rig| r.engine.voices.iter().filter(|v| v.active && v.trigger == Trigger::Release).count();
+        let releases = |r: &Rig| r.layer().voices.iter().filter(|v| v.active && v.trigger == Trigger::Release).count();
         assert_eq!(releases(&rig), 0);
         rig.send(cc(64, 0));
         assert_eq!(releases(&rig), 1);
@@ -1266,7 +1402,7 @@ mod tests {
         rig.send(on(60, 100));
         rig.send(on(13, 100));
         rig.send(on(62, 100));
-        let regions: Vec<u32> = rig.engine.voices.iter().filter(|v| v.active).map(|v| v.region).collect();
+        let regions: Vec<u32> = rig.layer().voices.iter().filter(|v| v.active).map(|v| v.region).collect();
         assert_eq!(regions, vec![0, 1]);
     }
 
@@ -1285,7 +1421,7 @@ mod tests {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
         rig.set(&[(ParamId::Transpose, 12)]);
         rig.send(on(57, 100));
-        let v = rig.engine.voices.iter().find(|v| v.active).unwrap();
+        let v = rig.layer().voices.iter().find(|v| v.active).unwrap();
         assert_eq!(v.note, 69);
         assert!((v.step - 1.0).abs() < 1e-9, "A3 + 12 plays the A4 sample unshifted");
         // Changing transpose while held must not orphan the note.
@@ -1300,7 +1436,7 @@ mod tests {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
         rig.set(&[(ParamId::Velocity, 50)]); // light 100 → gamma 0.25
         rig.send(on(60, 32));
-        let v = rig.engine.voices.iter().find(|v| v.active).unwrap();
+        let v = rig.layer().voices.iter().find(|v| v.active).unwrap();
         let expected = ((32.0f32 / 127.0).powf(0.25) * 127.0).round() as u8;
         assert_eq!(v.vel, expected);
         assert!(v.vel > 80);
@@ -1324,10 +1460,10 @@ mod tests {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
         rig.send(on(69, 100));
         rig.set(&[(ParamId::Detune, 200)]); // +100 cents
-        assert!((rig.engine.user.detune - 2f32.powf(100.0 / 1200.0)).abs() < 1e-6);
-        let pos0 = rig.engine.voices.iter().find(|v| v.active).unwrap().pos;
+        assert!((rig.layer().user.detune - 2f32.powf(100.0 / 1200.0)).abs() < 1e-6);
+        let pos0 = rig.layer().voices.iter().find(|v| v.active).unwrap().pos;
         rig.run(0.01);
-        let pos1 = rig.engine.voices.iter().find(|v| v.active).unwrap().pos;
+        let pos1 = rig.layer().voices.iter().find(|v| v.active).unwrap().pos;
         let frames = (0.01f32 * SR as f32 / 256.0).ceil() as f64 * 256.0;
         assert!(((pos1 - pos0) / frames - 2f64.powf(100.0 / 1200.0)).abs() < 1e-4);
     }
@@ -1359,12 +1495,12 @@ mod tests {
     fn samples_fade_out_at_their_end() {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
         rig.send(on(69, 127));
-        let frames = rig.engine.inst.samples[0].frames;
+        let frames = rig.layer().inst.samples[0].frames;
         // Jump close to the end of the 3 s sample.
-        rig.engine.voices.iter_mut().find(|v| v.active).unwrap().pos = (frames - 2400) as f64;
+        rig.layer_mut().voices.iter_mut().find(|v| v.active).unwrap().pos = (frames - 2400) as f64;
         rig.run(0.005); // 240 frames in: 2160 left of a 6000-frame fade
         let last = rig.buf.last().unwrap()[0].abs();
-        let v = rig.engine.voices.iter().find(|v| v.active).unwrap();
+        let v = rig.layer().voices.iter().find(|v| v.active).unwrap();
         let g = v.gain[0] * v.env.level * 32767.0;
         assert!(last <= g * 0.4, "fading near the end: {last} vs {g}");
         rig.run(0.1);
@@ -1383,7 +1519,7 @@ mod tests {
         rig.set(&[(ParamId::Attack, -100), (ParamId::Sustain, -20), (ParamId::Release, -100)]);
         rig.send(on(57, 127));
         rig.run(3.0);
-        let v = rig.engine.voices.iter().find(|v| v.active).unwrap();
+        let v = rig.layer().voices.iter().find(|v| v.active).unwrap();
         assert!((v.env.level - 0.5).abs() < 0.01, "held at the sustain level: {}", v.env.level);
         assert!(rig.rms(0.1) > 0.01, "a held synth note never runs out");
         rig.send(off(57));
@@ -1395,12 +1531,12 @@ mod tests {
     fn synth_attack_ramps_up() {
         let mut rig = Rig::new(synth("Sine"));
         rig.set(&[(ParamId::Attack, 50)]); // ~1.4 s
-        let attack = rig.engine.user.attack;
+        let attack = rig.layer().user.attack;
         assert!(attack > 1.0 && attack < 2.0, "{attack}");
         rig.send(on(69, 127));
         rig.run(0.25);
         let elapsed = (0.25f32 * SR as f32 / 256.0).ceil() * 256.0 / SR as f32;
-        let level = rig.engine.voices.iter().find(|v| v.active).unwrap().env.level;
+        let level = rig.layer().voices.iter().find(|v| v.active).unwrap().env.level;
         assert!((level - elapsed / attack).abs() < 0.01, "linear attack: {level}");
     }
 
@@ -1408,7 +1544,7 @@ mod tests {
     fn synth_pitch_and_unison() {
         let mut rig = Rig::new(synth("Super saw"));
         rig.send(on(69, 100));
-        let v = *rig.engine.voices.iter().find(|v| v.active).unwrap();
+        let v = *rig.layer().voices.iter().find(|v| v.active).unwrap();
         assert!((v.step - 440.0 / SR as f64).abs() < 1e-12);
         assert!(v.phases.iter().filter(|&&p| p != 0.0).count() >= 6, "unison phases randomised");
         let out = rig.rms(0.1);
@@ -1422,7 +1558,7 @@ mod tests {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
         rig.set(&[(ParamId::Attack, 100), (ParamId::Release, 100), (ParamId::Sustain, -100)]);
         rig.send(on(69, 100));
-        let level = { rig.run(0.01); rig.engine.voices[0].env.level };
+        let level = { rig.run(0.01); rig.layer().voices[0].env.level };
         assert_eq!(level, 1.0, "no added attack");
         rig.send(off(69));
         rig.run(0.5);
@@ -1437,9 +1573,9 @@ mod tests {
         // Measure phase advance per block over one LFO period: it must swing ~±6 %.
         let (mut lo, mut hi) = (f32::MAX, 0.0f32);
         for _ in 0..40 {
-            let before = rig.engine.voices[0].phases[0];
+            let before = rig.layer().voices[0].phases[0];
             rig.engine.render(&mut rig.buf);
-            let mut adv = rig.engine.voices[0].phases[0] - before;
+            let mut adv = rig.layer().voices[0].phases[0] - before;
             if adv < 0.0 {
                 adv += 1.0;
             }
@@ -1456,7 +1592,7 @@ mod tests {
         let level_at_cutoff = |res_steps: i32| {
             let mut rig = Rig::new(synth("Sine"));
             rig.set(&[(ParamId::LowPass, -60), (ParamId::Resonance, res_steps)]); // ~1.4 kHz
-            let cutoff = rig.engine.user.low_pass_hz;
+            let cutoff = rig.layer().user.low_pass_hz;
             let note = (69.0 + 12.0 * (cutoff / 440.0).log2()).round() as u8;
             rig.send(on(note, 127));
             rig.run(0.2);
@@ -1545,10 +1681,10 @@ mod tests {
         rig.send(on(57, 100));
         rig.run(0.1);
         rig.send(on(69, 100)); // legato: 57 still held
-        let v = *rig.engine.voices.iter().filter(|v| v.active).max_by_key(|v| v.started).unwrap();
+        let v = *rig.layer().voices.iter().filter(|v| v.active).max_by_key(|v| v.started).unwrap();
         assert!((v.glide_ratio - 0.5).abs() < 1e-3, "starts an octave below: {}", v.glide_ratio);
         rig.run(0.6);
-        let v = *rig.engine.voices.iter().filter(|v| v.active).max_by_key(|v| v.started).unwrap();
+        let v = *rig.layer().voices.iter().filter(|v| v.active).max_by_key(|v| v.started).unwrap();
         assert!((v.glide_ratio - 1.0).abs() < 0.01, "arrived: {}", v.glide_ratio);
 
         // A chord struck at once: no glide between its notes.
@@ -1557,17 +1693,89 @@ mod tests {
         rig.send(on(60, 100));
         rig.send(on(64, 100));
         rig.send(on(67, 100));
-        assert!(rig.engine.voices.iter().filter(|v| v.active).all(|v| v.glide_ratio == 1.0));
+        assert!(rig.layer().voices.iter().filter(|v| v.active).all(|v| v.glide_ratio == 1.0));
     }
 
     #[test]
     fn lfo_rate_sets_vibrato_speed() {
         let mut rig = Rig::new(synth("Sine"));
         rig.set(&[(ParamId::LfoRate, 100)]); // 20 Hz
-        let before = rig.engine.lfo_phase;
+        let before = rig.layer().lfo_phase;
         rig.run(0.5); // 94 blocks of 256 = 0.5013 s → 10.03 cycles
-        let cycles = (rig.engine.lfo_phase - before).rem_euclid(1.0);
+        let cycles = (rig.layer().lfo_phase - before).rem_euclid(1.0);
         assert!((cycles - 0.0267).abs() < 0.01, "fractional cycles {cycles}");
+    }
+
+    /// An engine with a sampled sine layer (id 0) and a saw synth layer (id 1).
+    fn two_layers() -> (Engine, Sender<EngineCmd>, Receiver<Garbage>) {
+        let (tx, rx) = crossbeam_channel::bounded(256);
+        let (gtx, grx) = crossbeam_channel::bounded(16);
+        let layers = vec![
+            Layer::new(0, SR, Arc::new(Instrument::builtin_sine(SR)), &Params::default(), false),
+            Layer::new(1, SR, Arc::new(synth("Saw")), &Params::default(), false),
+        ];
+        (Engine::new(SR, layers, rx, gtx, Arc::new(Stats::default())), tx, grx)
+    }
+
+    fn active_in(e: &Engine, id: LayerId) -> usize {
+        e.layers.iter().find(|l| l.id == id).map_or(0, |l| l.voices.iter().filter(|v| v.active).count())
+    }
+
+    fn send_to(e: &mut Engine, tx: &Sender<EngineCmd>, cmd: EngineCmd) {
+        tx.send(cmd).unwrap();
+        e.begin_callback(256, 0);
+    }
+
+    #[test]
+    fn every_layer_plays_each_note_with_its_own_settings() {
+        let (mut e, tx, _g) = two_layers();
+        let mut p = Params::default();
+        p.nudge(ParamId::Transpose, 12);
+        send_to(&mut e, &tx, EngineCmd::Params(1, p));
+        send_to(&mut e, &tx, EngineCmd::Midi { event: on(57, 100), at: Instant::now() });
+        assert_eq!((active_in(&e, 0), active_in(&e, 1)), (1, 1));
+        let notes: Vec<u8> = e.layers.iter().map(|l| l.voices.iter().find(|v| v.active).unwrap().note).collect();
+        assert_eq!(notes, vec![57, 69], "transpose only on the synth layer");
+        send_to(&mut e, &tx, EngineCmd::Midi { event: off(57), at: Instant::now() });
+        let mut buf = [[0.0; 2]; 256];
+        for _ in 0..200 {
+            e.render(&mut buf);
+        }
+        assert_eq!((active_in(&e, 0), active_in(&e, 1)), (0, 0), "both released despite different transposes");
+    }
+
+    #[test]
+    fn mute_silences_one_layer() {
+        let (mut e, tx, _g) = two_layers();
+        send_to(&mut e, &tx, EngineCmd::Mute(1, true));
+        send_to(&mut e, &tx, EngineCmd::Midi { event: on(60, 100), at: Instant::now() });
+        assert_eq!((active_in(&e, 0), active_in(&e, 1)), (1, 0));
+        let mut buf = [[0.0; 2]; 256];
+        e.render(&mut buf);
+        assert!(buf.iter().any(|f| f[0].abs() > 1e-3), "the other layer still sounds");
+        send_to(&mut e, &tx, EngineCmd::Mute(0, true));
+        for _ in 0..4 {
+            e.render(&mut buf);
+        }
+        assert!(buf.iter().all(|f| f[0] == 0.0), "all muted: silence");
+    }
+
+    #[test]
+    fn layers_come_and_go_without_freeing_on_the_audio_thread() {
+        let (mut e, tx, garbage) = two_layers();
+        send_to(&mut e, &tx, EngineCmd::RemoveLayer(0));
+        assert_eq!(e.layers.len(), 1);
+        assert!(matches!(garbage.try_recv(), Ok(Garbage::Layer(l)) if l.id == 0));
+        let capacity = e.layers.capacity();
+        for id in 10..10 + MAX_LAYERS as LayerId {
+            let layer = Layer::new(id, SR, Arc::new(synth("Sine")), &Params::default(), false);
+            send_to(&mut e, &tx, EngineCmd::AddLayer(layer));
+        }
+        assert_eq!(e.layers.len(), MAX_LAYERS);
+        assert_eq!(e.layers.capacity(), capacity, "no reallocation");
+        assert!(matches!(garbage.try_recv(), Ok(Garbage::Layer(_))), "the extra layer is handed back");
+        send_to(&mut e, &tx, EngineCmd::SetInstrument(1, Arc::new(synth("Square"))));
+        assert!(matches!(garbage.try_recv(), Ok(Garbage::Instrument(_))), "old instrument handed back");
     }
 
     #[test]

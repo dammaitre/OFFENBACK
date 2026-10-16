@@ -11,8 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, DeviceDirection, FromSample, SampleFormat, SizedSample, StreamConfig};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::engine::{Engine, EngineCmd, Stats};
-use crate::instrument::Instrument;
+use crate::engine::{Engine, EngineCmd, Garbage, Layer, LayerSpec, Stats};
 
 /// Frames rendered per engine call; the callback loops when the device asks for more.
 const BLOCK: usize = crate::recorder::BLOCK_FRAMES;
@@ -69,9 +68,9 @@ pub struct AudioOut {
 pub fn open(
     query: Option<&str>,
     buffer: Option<u32>,
-    instrument: Arc<Instrument>,
+    layers: &[LayerSpec],
     cmds: Receiver<EngineCmd>,
-    garbage: Sender<Arc<Instrument>>,
+    garbage: Sender<Garbage>,
     stats: Arc<Stats>,
 ) -> Result<AudioOut> {
     let host = cpal::default_host();
@@ -105,7 +104,11 @@ pub fn open(
     }
     config.buffer_size = buffer.map_or(BufferSize::Default, BufferSize::Fixed);
 
-    let engine = Engine::new(config.sample_rate, instrument, cmds, garbage, stats.clone());
+    let layers = layers
+        .iter()
+        .map(|l| Layer::new(l.id, config.sample_rate, l.instrument.clone(), &l.params, l.muted))
+        .collect();
+    let engine = Engine::new(config.sample_rate, layers, cmds, garbage, stats.clone());
     let stream = match format {
         SampleFormat::F32 => build::<f32>(&device, &config, engine, stats),
         SampleFormat::I16 => build::<i16>(&device, &config, engine, stats),

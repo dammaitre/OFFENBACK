@@ -66,11 +66,11 @@ fn main() -> Result<()> {
         }
     }
 
-    let sfz = sfz.or_else(|| {
-        let p = PathBuf::from(std::env::var_os("HOME")?).join(DEFAULT_SFZ);
-        p.exists().then_some(p)
-    });
-    let mut app = tui::App::new(output, buffer, sfz);
+    let piano = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(DEFAULT_SFZ))
+        .filter(|p| p.exists());
+    let sfz = sfz.or_else(|| piano.clone());
+    let mut app = tui::App::new(output, buffer, sfz, piano);
     if let Some(query) = port {
         app.connect(&query);
     }

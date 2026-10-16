@@ -52,6 +52,9 @@ TUI thread ── lock-free parameter queue (no alloc/locks in audio callback)
    classic synth ADSR and greyed out for sampled instruments; LFO = vibrato (5.5 Hz); Resonance on the master
    low-pass for every instrument. Filter env (+0..8 oct, per-voice LP on synths), Glide (legato portamento,
    chords excluded), LFO rate (0.1-20 Hz). Matrix is 3 rows of 6.
+7c. ✅ **Layers**: up to 8 instruments play together, each with its own matrix settings; shared reverb,
+   limiter and recorder. Layer bar under the top bar; Alt+Enter instrument, Alt+N new piano, Alt+D duplicate,
+   Alt+M mute, Alt+K remove, Alt+←→ select. Layers using the same SFZ share its samples.
 8. **Bluetooth tuning**: PipeWire bluez5 latency settings, SBC-XQ, latency offset measurement.
 
 ## Latency budget

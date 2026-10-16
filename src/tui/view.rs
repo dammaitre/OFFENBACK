@@ -17,14 +17,16 @@ const LIGHT_ON: Color = Color::LightGreen;
 const LIGHT_OFF: Color = Color::DarkGray;
 const CELL_MIN_WIDTH: u16 = 16;
 const CELL_HEIGHT: u16 = 5;
+const LAYER_COL_WIDTH: u16 = 26;
 /// Piano range shown by the mini keyboard (A0..C8).
 const KEY_LO: u8 = 21;
 const KEY_HI: u8 = 108;
 
 impl App {
     pub(super) fn draw(&mut self, f: &mut Frame) {
-        let [top, main, keyboard, bottom] = Layout::vertical([
+        let [top, layers, main, keyboard, bottom] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(CELL_HEIGHT * ParamId::ALL.len().div_ceil(MATRIX_COLS) as u16 + 2),
             Constraint::Length(3),
             Constraint::Length(1),
@@ -32,6 +34,7 @@ impl App {
         .areas(f.area());
 
         self.draw_top_bar(f, top);
+        self.draw_layer_bar(f, layers);
         self.draw_matrix(f, main);
         self.draw_keyboard(f, keyboard);
         self.draw_bottom_bar(f, bottom);
@@ -66,15 +69,72 @@ impl App {
         f.render_widget(right, r);
     }
 
-    fn draw_matrix(&mut self, f: &mut Frame, area: Rect) {
-        let title = match &self.loading {
-            Some(l) => {
-                let (done, total) = (l.progress.done.load(Relaxed), l.progress.total.load(Relaxed).max(1));
-                format!(" Loading {}… {}% ", l.name, done * 100 / total)
+    /// One column per layer, scrolling sideways to keep the current one visible.
+    fn draw_layer_bar(&mut self, f: &mut Frame, area: Rect) {
+        let visible = ((area.width / LAYER_COL_WIDTH).max(1) as usize).min(self.layers.len());
+        if self.current < self.layer_scroll {
+            self.layer_scroll = self.current;
+        } else if self.current >= self.layer_scroll + visible {
+            self.layer_scroll = self.current + 1 - visible;
+        }
+        let scroll = self.layer_scroll.min(self.layers.len() - visible);
+        self.layer_rects.clear();
+        for (k, i) in (scroll..scroll + visible).enumerate() {
+            let rect = Rect { x: area.x + k as u16 * LAYER_COL_WIDTH, width: LAYER_COL_WIDTH, ..area }.intersection(area);
+            let l = &self.layers[i];
+            let selected = i == self.current;
+            let loading = self.loading.as_ref().filter(|ld| ld.layer == l.id);
+            let (border, text) = match (selected, l.muted) {
+                (_, true) => (Style::new().fg(Color::DarkGray), Style::new().fg(Color::DarkGray).italic()),
+                (true, false) => (Style::new().fg(ACCENT).bold(), Style::new().fg(ACCENT).bold()),
+                (false, false) => (Style::new().fg(Color::Gray), Style::new()),
+            };
+            let mut title = format!(" {} ", i + 1);
+            if l.muted {
+                title.push_str("muted ");
             }
-            None => format!(" {} ", self.instrument.name),
-        };
-        let block = Block::bordered().border_type(BorderType::Rounded).title(title.bold());
+            let block = Block::bordered()
+                .border_type(if selected { BorderType::Thick } else { BorderType::Rounded })
+                .border_style(border)
+                .title(title);
+            let label = match loading {
+                Some(ld) => {
+                    let (done, total) = (ld.progress.done.load(Relaxed), ld.progress.total.load(Relaxed).max(1));
+                    format!("{} {}%", ld.name, done * 100 / total)
+                }
+                None => l.instrument.name.clone(),
+            };
+            let width = rect.width.saturating_sub(4) as usize;
+            let label: String = if label.chars().count() > width {
+                label.chars().take(width.saturating_sub(1)).chain(['…']).collect()
+            } else {
+                label
+            };
+            f.render_widget(Paragraph::new(Line::styled(label, text).centered()).block(block), rect);
+            self.layer_rects.push((i, rect));
+        }
+        // Room left: scroll hints and a reminder of the layer keys.
+        let used = visible as u16 * LAYER_COL_WIDTH;
+        if area.width > used + 2 {
+            let rest = Rect { x: area.x + used + 1, width: area.width - used - 1, y: area.y + 1, height: 1 };
+            let mut hint = String::new();
+            if scroll > 0 {
+                hint.push_str("◀ ");
+            }
+            if scroll + visible < self.layers.len() {
+                hint.push_str("▶ ");
+            }
+            hint.push_str("Alt+N new  Alt+D duplicate  Alt+←→ select");
+            f.render_widget(Line::from(hint).dark_gray(), rest);
+        }
+    }
+
+    fn draw_matrix(&mut self, f: &mut Frame, area: Rect) {
+        let title = format!(" Layer {} · {} ", self.current + 1, self.layer().instrument.name);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(title.bold())
+            .title_bottom(Line::from(format!(" {} ", self.status)).dark_gray());
         let inner = block.inner(area);
 
         let visible = ((inner.width / CELL_MIN_WIDTH).max(1) as usize).min(MATRIX_COLS);
@@ -123,8 +183,9 @@ impl App {
 
     fn draw_cell(&self, f: &mut Frame, area: Rect, id: ParamId, selected: bool) {
         let spec = id.spec();
-        let value = self.params.get(id);
-        let changed = !self.params.is_default(id);
+        let params = &self.layer().params;
+        let value = params.get(id);
+        let changed = !params.is_default(id);
         let enabled = self.is_enabled(id);
         let border = if selected {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
@@ -195,11 +256,14 @@ impl App {
             [Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(ACCENT)), Span::raw(format!(" {label}  "))]
         };
         let record = if self.recording.is_some() { "Stop rec" } else { "Record" };
-        let mut spans: Vec<Span> = [key("o", "Output"), key("p", "Port"), key("i", "Instrument"), key("r", record), key("q", "Quit")]
+        let mut spans: Vec<Span> = [key("o", "Output"), key("p", "Port"), key("r", record), key("q", "Quit")]
             .into_iter()
             .flatten()
             .collect();
-        spans.push(Span::raw(format!("│ {}", self.status)).dim());
+        spans.push(Span::raw("│ ").dark_gray());
+        spans.extend(
+            [key("Alt+⏎", "Instrument"), key("Alt+M", "Mute"), key("Alt+K", "Kill")].into_iter().flatten(),
+        );
         f.render_widget(Line::from(spans), area);
     }
 
@@ -219,7 +283,7 @@ impl App {
         let (title, keys) = match popup {
             Popup::Port => (" MIDI input ", " ↑↓ select  ⏎ connect  r refresh  esc close "),
             Popup::Output => (" Audio output ", " ⏎ use  [ ] buffer  t test  l reset worst  esc close "),
-            Popup::Instrument => (" Instrument ", " ↑↓ select  ⏎ load  r refresh  esc close "),
+            Popup::Instrument => (" Instrument for this layer ", " ↑↓ select  ⏎ load  r refresh  esc close "),
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -247,7 +311,7 @@ impl App {
                 (items, &mut self.output_list, "No audio output found. Press r to refresh.")
             }
             Popup::Instrument => {
-                let current = self.instrument_source.as_ref();
+                let current = self.layer().source.as_ref();
                 let home = std::env::var("HOME").unwrap_or_default();
                 let items = self
                     .instruments
