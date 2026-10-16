@@ -96,11 +96,15 @@ const SPECS: [Spec; 11] = [
         name: "Sustain",
         min: 0.0,
         max: 100.0,
-        default: 100.0,
+        default: 0.0,
         scale: Scale::Linear,
         steps: 100,
-        format: |v| format!("{v:.0} %"),
-        default_label: None,
+        format: |v| match sustain_seconds(v) {
+            _ if v >= 100.0 => "pedal".into(),
+            Some(s) => format!("{s:.1} s"),
+            None => "off".into(),
+        },
+        default_label: Some("off"),
     },
     Spec {
         name: "Release",
@@ -173,6 +177,12 @@ const SPECS: [Spec; 11] = [
         default_label: Some("linear"),
     },
 ];
+
+/// Ring time after key release for a Sustain setting: 0 → none, 1..99 % → 0.2..20 s
+/// (equal ratios per step), 100 % → the pedal (handled by the engine, `None` here too).
+pub fn sustain_seconds(pct: f32) -> Option<f32> {
+    (pct > 0.0 && pct < 100.0).then(|| 0.2 * 100f32.powf((pct - 1.0) / 98.0))
+}
 
 /// Touch curve exponent for the Velocity parameter: light (+100) → 0.25, heavy (-100) → 4.
 pub fn velocity_gamma(amount: f32) -> f32 {
@@ -279,5 +289,9 @@ mod tests {
         assert_eq!(ParamId::LowPass.spec().format(20_000.0), "off");
         assert_eq!(ParamId::LowPass.spec().format(1200.0), "1.2 kHz");
         assert_eq!(ParamId::Release.spec().format(1.0), "×1.00");
+        assert_eq!(ParamId::Sustain.spec().format(0.0), "off");
+        assert_eq!(ParamId::Sustain.spec().format(1.0), "0.2 s");
+        assert_eq!(ParamId::Sustain.spec().format(99.0), "20.0 s");
+        assert_eq!(ParamId::Sustain.spec().format(100.0), "pedal");
     }
 }

@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::instrument::{CC_COUNT, Ctx, FilterKind, Instrument, Region, Trigger};
 use crate::midi::MidiEvent;
-use crate::params::{ParamId, Params, velocity_gamma};
+use crate::params::{ParamId, Params, sustain_seconds, velocity_gamma};
 
 const MAX_VOICES: usize = 128;
 const BEND_RANGE_CENTS: f32 = 200.0;
@@ -23,6 +23,8 @@ const SILENCE: f32 = 1e-4;
 const LN_1000: f32 = 6.907_755;
 const ALL_SOUND_OFF_CC: u8 = 120;
 const ALL_NOTES_OFF_CC: u8 = 123;
+/// The physical sustain pedal; the matrix's virtual pedal is merged into it.
+const PEDAL_CC: usize = 64;
 /// Master filters at these cutoffs are bypassed.
 const LOW_PASS_OFF_HZ: f32 = 19_900.0;
 const HIGH_PASS_OFF_HZ: f32 = 20.5;
@@ -34,6 +36,16 @@ pub enum EngineCmd {
     Params(Params),
 }
 
+/// The matrix's Sustain: how long notes keep ringing after the key is released.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Sustain {
+    Off,
+    /// Released notes fade over at least this many seconds.
+    Ring(f32),
+    /// Like holding the sustain pedal down.
+    Pedal,
+}
+
 /// The effects matrix, converted to what the audio thread needs.
 #[derive(Clone, Copy)]
 struct User {
@@ -41,9 +53,9 @@ struct User {
     transpose: i32,
     detune: f32,
     attack_s: f32,
-    /// Extra fade time and its floor; `None` when Decay is off.
+    /// Extra fade-out time while held; `None` when Decay is off.
     decay_s: Option<f32>,
-    sustain: f32,
+    sustain: Sustain,
     release_mult: f32,
     low_pass_hz: f32,
     high_pass_hz: f32,
@@ -58,12 +70,21 @@ impl User {
             detune: 2f32.powf(p.get(ParamId::Detune) / 1200.0),
             attack_s: p.get(ParamId::Attack) / 1000.0,
             decay_s: (!p.is_default(ParamId::Decay)).then(|| p.get(ParamId::Decay)),
-            sustain: p.get(ParamId::Sustain) / 100.0,
+            sustain: match sustain_seconds(p.get(ParamId::Sustain)) {
+                _ if p.get(ParamId::Sustain) >= 100.0 => Sustain::Pedal,
+                Some(s) => Sustain::Ring(s),
+                None => Sustain::Off,
+            },
             release_mult: p.get(ParamId::Release),
             low_pass_hz: p.get(ParamId::LowPass),
             high_pass_hz: p.get(ParamId::HighPass),
             vel_gamma: velocity_gamma(p.get(ParamId::Velocity)),
         }
+    }
+
+    /// Virtual pedal position, merged with the physical one.
+    fn pedal(&self) -> f32 {
+        if self.sustain == Sustain::Pedal { 1.0 } else { 0.0 }
     }
 
     fn velocity(&self, vel: u8) -> u8 {
@@ -347,6 +368,8 @@ pub struct Engine {
     ccs: [f32; CC_COUNT],
     bend: f32,
     user: User,
+    /// Physical sustain pedal (CC64) as last received; `ccs[64]` holds the merged value.
+    pedal_cc: f32,
     /// Smoothed master gain.
     gain: f32,
     gain_step: f32,
@@ -390,6 +413,7 @@ impl Engine {
             voices: vec![Voice::IDLE; MAX_VOICES],
             bend: 1.0,
             user: User::new(&Params::default()),
+            pedal_cc: 0.0,
             gain: 1.0,
             gain_step: 1.0 - (-1.0 / (0.01 * sr)).exp(),
             low_pass: Biquad::new(FilterKind::Lpf2p, 20_000.0, 0.0, sr),
@@ -428,7 +452,10 @@ impl Engine {
                     self.handle(event);
                 }
                 EngineCmd::SetInstrument(inst) => self.set_instrument(inst),
-                EngineCmd::Params(p) => self.user = User::new(&p),
+                EngineCmd::Params(p) => {
+                    self.user = User::new(&p);
+                    self.apply_cc(PEDAL_CC, self.pedal_cc.max(self.user.pedal()));
+                }
             }
         }
         self.stats.output_us.store(output_delay_us, Relaxed);
@@ -441,6 +468,7 @@ impl Engine {
             v.active = false;
         }
         self.ccs = inst.cc_defaults;
+        self.ccs[PEDAL_CC] = self.pedal_cc.max(self.user.pedal());
         self.sw_last = inst.sw_default;
         self.release_pending = [false; 128];
         let old = std::mem::replace(&mut self.inst, inst);
@@ -547,13 +575,25 @@ impl Engine {
     }
 
     fn control(&mut self, cc: u8, value: u8) {
-        let c = cc as usize;
+        let v = value as f32 / 127.0;
+        if cc as usize == PEDAL_CC {
+            self.pedal_cc = v;
+            self.apply_cc(PEDAL_CC, v.max(self.user.pedal()));
+        } else {
+            self.apply_cc(cc as usize, v);
+        }
+    }
+
+    /// Sets controller `c` to `new` (0..1) and runs everything that depends on it.
+    fn apply_cc(&mut self, c: usize, new: f32) {
         let old = self.ccs[c];
-        let new = value as f32 / 127.0;
+        if old == new {
+            return;
+        }
         self.ccs[c] = new;
         let inst = self.inst.clone();
 
-        if cc == ALL_NOTES_OFF_CC || cc == ALL_SOUND_OFF_CC {
+        if c == ALL_NOTES_OFF_CC as usize || c == ALL_SOUND_OFF_CC as usize {
             for i in 0..self.voices.len() {
                 if self.voices[i].active {
                     self.voices[i].key_down = false;
@@ -563,7 +603,7 @@ impl Engine {
             return;
         }
 
-        if cc as u16 == inst.sustain_cc && old >= 0.5 && new < 0.5 {
+        if c == inst.sustain_cc as usize && old >= 0.5 && new < 0.5 {
             for i in 0..self.voices.len() {
                 let v = &self.voices[i];
                 if v.active && v.sustained && !v.key_down {
@@ -606,7 +646,10 @@ impl Engine {
     fn release_voice(&mut self, inst: &Instrument, i: usize) {
         let v = self.voices[i];
         let r = &inst.regions[v.region as usize];
-        let seconds = r.ampeg.release.eval(&self.ctx(inst, v.note, v.vel)) * self.user.release_mult;
+        let mut seconds = r.ampeg.release.eval(&self.ctx(inst, v.note, v.vel)) * self.user.release_mult;
+        if let Sustain::Ring(ring) = self.user.sustain {
+            seconds = seconds.max(ring);
+        }
         self.voices[i].env.release(seconds.max(0.0005), self.sr);
     }
 
@@ -713,7 +756,7 @@ impl Engine {
             gain: [gain * (1.0 - pan).min(1.0), gain * (1.0 + pan).min(1.0)],
             env,
             fade: 1.0,
-            fade_floor: self.user.decay_s.map_or(1.0, |_| self.user.sustain),
+            fade_floor: self.user.decay_s.map_or(1.0, |_| 0.0),
             fade_coef: self.user.decay_s.map_or(1.0, |t| exp_coef(t, self.sr)),
             filter,
             key_down: r.trigger == Trigger::Attack,
@@ -768,6 +811,10 @@ impl Engine {
                     r = f.process(1, r);
                 }
                 v.fade = v.fade_floor + (v.fade - v.fade_floor) * v.fade_coef;
+                if v.fade < SILENCE {
+                    v.active = false;
+                    break;
+                }
                 let e = e * v.fade;
                 frame[0] += l * v.gain[0] * e;
                 frame[1] += r * v.gain[1] * e;
@@ -1134,13 +1181,68 @@ mod tests {
     }
 
     #[test]
-    fn decay_fades_towards_sustain() {
+    fn decay_fades_held_notes_out() {
         let mut rig = Rig::new(Instrument::builtin_sine(SR));
-        rig.set(&[(ParamId::Decay, -100), (ParamId::Sustain, -50)]); // 0.2 s towards 50 %
+        rig.set(&[(ParamId::Decay, -100)]); // 0.2 s
         rig.send(on(69, 100));
+        rig.run(0.1);
+        assert_eq!(rig.active(), 1);
+        rig.run(0.3);
+        assert_eq!(rig.active(), 0, "held note faded out by Decay");
+    }
+
+    #[test]
+    fn sustain_ring_time_lengthens_released_notes() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Sustain, 50)]); // ~2 s
+        rig.send(on(69, 100));
+        rig.send(off(69));
         rig.run(1.0);
-        let fade = rig.engine.voices.iter().find(|v| v.active).unwrap().fade;
-        assert!((fade - 0.5).abs() < 0.01, "{fade}");
+        assert_eq!(rig.active(), 1, "still ringing 1 s after release");
+        // -60 dB over the 2 s ring time; voices end at -80 dB, i.e. ~2.7 s.
+        rig.run(2.0);
+        assert_eq!(rig.active(), 0);
+    }
+
+    #[test]
+    fn sustain_pedal_mode_acts_like_the_pedal() {
+        let mut rig = Rig::new(Instrument::builtin_sine(SR));
+        rig.set(&[(ParamId::Sustain, 100)]);
+        assert_eq!(rig.engine.ccs[PEDAL_CC], 1.0);
+        rig.send(on(69, 100));
+        rig.send(off(69));
+        // The physical pedal going up must not cancel the virtual one.
+        rig.send(cc(64, 127));
+        rig.send(cc(64, 0));
+        rig.run(0.5);
+        assert_eq!(rig.active(), 1);
+        rig.set(&[]); // Sustain back to off = pedal lifted
+        assert_eq!(rig.engine.ccs[PEDAL_CC], 0.0);
+        rig.run(0.5);
+        assert_eq!(rig.active(), 0);
+    }
+
+    #[test]
+    fn splendid_virtual_pedal_adds_resonance_and_rings() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let path = std::path::Path::new(&home).join("Sounds/SFZ/SplendidGrandPiano/Splendid Grand Piano.sfz");
+        if !path.exists() {
+            return;
+        }
+        let inst = crate::instrument::load_sfz(&path, &Default::default()).unwrap();
+        let mut rig = Rig::new(inst);
+        rig.send(on(60, 90));
+        assert_eq!(rig.active(), 1, "no pedal: just the note");
+        rig.send(off(60));
+        rig.run(2.0);
+        assert_eq!(rig.active(), 0, "damped within 2 s");
+
+        rig.set(&[(ParamId::Sustain, 100)]);
+        rig.send(on(60, 90));
+        assert_eq!(rig.active(), 2, "pedal: note + string resonance layer");
+        rig.send(off(60));
+        rig.run(2.0);
+        assert_eq!(rig.active(), 2, "still ringing with the virtual pedal");
     }
 
     #[test]
