@@ -282,6 +282,20 @@ impl Spec {
         }
     }
 
+    /// `v` moved by `steps` notches (negative = down). The grid is anchored on the default,
+    /// so stepping away and back always lands exactly on it, even when it's between grid
+    /// points of the raw range.
+    pub fn nudged(&self, v: f32, steps: i32) -> f32 {
+        let (n_def, per) = (self.to_norm(self.default), self.steps as f32);
+        let k = ((self.to_norm(v) - n_def) * per).round() as i32 + steps;
+        let n = (n_def + k as f32 / per).clamp(0.0, 1.0);
+        if k == 0 { self.default } else { self.from_norm(n) }
+    }
+
+    pub fn is_default(&self, v: f32) -> bool {
+        (self.to_norm(v) - self.to_norm(self.default)).abs() < 0.5 / self.steps as f32
+    }
+
     pub fn format(&self, v: f32) -> String {
         match self.default_label {
             Some(label) if (v - self.default).abs() <= f32::EPSILON * self.max.abs().max(1.0) => label.into(),
@@ -307,15 +321,9 @@ impl Params {
         self.values[id as usize]
     }
 
-    /// Moves `id` by `steps` notches (negative = down). The grid is anchored on the default,
-    /// so stepping away and back always lands exactly on it, even when it's between grid
-    /// points of the raw range.
+    /// Moves `id` by `steps` notches (negative = down), see `Spec::nudged`.
     pub fn nudge(&mut self, id: ParamId, steps: i32) {
-        let spec = id.spec();
-        let (n_def, per) = (spec.to_norm(spec.default), spec.steps as f32);
-        let k = ((spec.to_norm(self.get(id)) - n_def) * per).round() as i32 + steps;
-        let n = (n_def + k as f32 / per).clamp(0.0, 1.0);
-        self.values[id as usize] = if k == 0 { spec.default } else { spec.from_norm(n) };
+        self.values[id as usize] = id.spec().nudged(self.get(id), steps);
     }
 
     /// Sets `id` to `value`, clamped to its range (presets).
@@ -329,8 +337,83 @@ impl Params {
     }
 
     pub fn is_default(&self, id: ParamId) -> bool {
-        let spec = id.spec();
-        (spec.to_norm(self.get(id)) - spec.to_norm(spec.default)).abs() < 0.5 / spec.steps as f32
+        id.spec().is_default(self.get(id))
+    }
+}
+
+/// Centre frequencies of the master graphic EQ, one band per octave.
+pub const EQ_BANDS: [f32; 10] = [31.0, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16_000.0];
+const EQ_NAMES: [&str; 10] = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+/// Master strip controls: level, then one per EQ band.
+pub const MASTER_COUNT: usize = 1 + EQ_BANDS.len();
+
+const MASTER_LEVEL: Spec = Spec {
+    name: "Master",
+    min: -48.0,
+    max: 12.0,
+    default: 0.0,
+    scale: Scale::Linear,
+    steps: 120,
+    format: |v| format!("{v:+.1} dB"),
+    default_label: None,
+};
+
+const EQ_GAIN: Spec = Spec {
+    name: "EQ",
+    min: -12.0,
+    max: 12.0,
+    default: 0.0,
+    scale: Scale::Linear,
+    steps: 48,
+    format: |v| format!("{v:+.1}"),
+    default_label: Some("0"),
+};
+
+/// The master strip, applied to the mix of every layer: level and graphic EQ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Master {
+    /// `MASTER_COUNT` values: level in dB, then each band's gain in dB.
+    values: [f32; MASTER_COUNT],
+}
+
+impl Default for Master {
+    fn default() -> Self {
+        Self { values: std::array::from_fn(|i| Self::spec(i).default) }
+    }
+}
+
+impl Master {
+    pub fn spec(i: usize) -> &'static Spec {
+        if i == 0 { &MASTER_LEVEL } else { &EQ_GAIN }
+    }
+
+    /// Short label shown in the strip.
+    pub fn label(i: usize) -> &'static str {
+        if i == 0 { MASTER_LEVEL.name } else { EQ_NAMES[i - 1] }
+    }
+
+    pub fn get(&self, i: usize) -> f32 {
+        self.values[i]
+    }
+
+    pub fn level_db(&self) -> f32 {
+        self.values[0]
+    }
+
+    pub fn band_db(&self, band: usize) -> f32 {
+        self.values[1 + band]
+    }
+
+    pub fn nudge(&mut self, i: usize, steps: i32) {
+        self.values[i] = Self::spec(i).nudged(self.values[i], steps);
+    }
+
+    pub fn reset(&mut self, i: usize) {
+        self.values[i] = Self::spec(i).default;
+    }
+
+    pub fn is_default(&self, i: usize) -> bool {
+        Self::spec(i).is_default(self.values[i])
     }
 }
 
@@ -374,5 +457,21 @@ mod tests {
         assert_eq!(ParamId::Glide.spec().format(0.0), "off");
         assert!(ParamId::Glide.synth_only() && ParamId::FilterEnv.synth_only());
         assert!(ParamId::Sustain.synth_only() && !ParamId::Resonance.synth_only());
+    }
+
+    #[test]
+    fn master_strip_steps() {
+        let mut m = Master::default();
+        m.nudge(0, -1);
+        assert_eq!(m.level_db(), -0.5);
+        m.nudge(3, 1);
+        assert_eq!(m.band_db(2), 0.5);
+        assert_eq!(Master::spec(3).format(m.get(3)), "+0.5");
+        m.nudge(3, -1);
+        assert!(m.is_default(3));
+        assert_eq!(Master::spec(3).format(m.get(3)), "0");
+        m.nudge(10, 1000);
+        assert_eq!(m.band_db(9), 12.0);
+        assert_eq!((Master::label(0), Master::label(6), Master::label(10)), ("Master", "1k", "16k"));
     }
 }

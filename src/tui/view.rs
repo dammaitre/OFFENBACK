@@ -1,4 +1,4 @@
-//! Drawing: top bar, effects matrix, mini keyboard, bottom bar and popups.
+//! Drawing: top bar, effects matrix, mini keyboard, master strip, bottom bar and popups.
 
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 
 use super::{App, BUFFER_SIZES, MATRIX_COLS, Popup};
 use crate::audio;
-use crate::params::ParamId;
+use crate::params::{MASTER_COUNT, Master, ParamId};
 
 const ACCENT: Color = Color::Cyan;
 const LIGHT_ON: Color = Color::LightGreen;
@@ -18,16 +18,19 @@ const LIGHT_OFF: Color = Color::DarkGray;
 const CELL_MIN_WIDTH: u16 = 16;
 const CELL_HEIGHT: u16 = 5;
 const LAYER_COL_WIDTH: u16 = 26;
+/// Master level column; the EQ bands share the rest of the strip.
+const MASTER_COL_WIDTH: u16 = 18;
 /// Piano range shown by the mini keyboard (A0..C8).
 const KEY_LO: u8 = 21;
 const KEY_HI: u8 = 108;
 
 impl App {
     pub(super) fn draw(&mut self, f: &mut Frame) {
-        let [top, layers, main, keyboard, bottom] = Layout::vertical([
+        let [top, layers, main, keyboard, master, bottom] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Min(CELL_HEIGHT * ParamId::ALL.len().div_ceil(MATRIX_COLS) as u16 + 2),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
@@ -37,6 +40,7 @@ impl App {
         self.draw_layer_bar(f, layers);
         self.draw_matrix(f, main);
         self.draw_keyboard(f, keyboard);
+        self.draw_master(f, master);
         self.draw_bottom_bar(f, bottom);
         if let Some(popup) = self.popup {
             self.draw_popup(f, popup, main);
@@ -249,6 +253,53 @@ impl App {
         }
         let [kb] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(area);
         f.render_widget(Paragraph::new(vec![Line::from(top), Line::from(bottom)]), kb);
+    }
+
+    /// Thin strip: a rule with the keys, then per control a "label value" row and a gauge.
+    fn draw_master(&mut self, f: &mut Frame, area: Rect) {
+        let [rule, labels, gauges] = Layout::vertical([Constraint::Length(1); 3]).areas(area);
+        let title = Line::from(vec!["─ ".dark_gray(), "Master bus".bold(), " ".into()]);
+        let keys = Line::from(" Ctrl+←→ select  Ctrl+↑↓/scroll adjust  Ctrl+Space reset ─").dark_gray();
+        let keys_w = keys.width() as u16;
+        f.render_widget(Line::from("─".repeat(rule.width as usize)).dark_gray(), rule);
+        f.render_widget(title, rule);
+        if rule.width > keys_w + 14 {
+            f.render_widget(keys, Rect { x: rule.right() - keys_w, width: keys_w, ..rule });
+        }
+
+        let mut widths = vec![Constraint::Length(MASTER_COL_WIDTH)];
+        widths.extend([Constraint::Fill(1); MASTER_COUNT - 1]);
+        let columns = Layout::horizontal(widths).spacing(1).split(labels);
+        self.master_rects.clear();
+        for (i, &col) in columns.iter().enumerate() {
+            let spec = Master::spec(i);
+            let value = self.master.get(i);
+            let selected = i == self.master_selected;
+            let label_style = if selected {
+                Style::new().fg(Color::Black).bg(ACCENT).bold()
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            let value_style = if !self.master.is_default(i) { Style::new().fg(Color::Yellow).bold() } else { Style::new() };
+            let (label, shown) = (Master::label(i), spec.format(value));
+            let line = Line::from(vec![
+                Span::styled(format!(" {label} "), label_style),
+                Span::raw(" "),
+                Span::styled(shown.clone(), value_style),
+            ]);
+            // Too narrow for both: label on top, the value replaces the gauge.
+            let fits = line.width() as u16 <= col.width;
+            let top = if fits { line } else { Line::from(Span::styled(format!(" {label} "), label_style)) };
+            let below = Rect { y: gauges.y, ..col };
+            f.render_widget(top.centered(), col);
+            let bottom = if fits {
+                gauge(col.width.saturating_sub(2) as usize, spec.to_norm(spec.default), spec.to_norm(value), selected)
+            } else {
+                Line::styled(shown, value_style)
+            };
+            f.render_widget(bottom.centered(), below);
+            self.master_rects.push((i, Rect { height: 2, ..col }));
+        }
     }
 
     fn draw_bottom_bar(&self, f: &mut Frame, area: Rect) {

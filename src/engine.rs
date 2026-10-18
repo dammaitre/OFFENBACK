@@ -14,14 +14,13 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::instrument::{CC_COUNT, Ctx, FilterKind, Instrument, Region, Trigger};
 use crate::midi::MidiEvent;
-use crate::params::{ParamId, Params, velocity_gamma};
+use crate::params::{EQ_BANDS, Master, ParamId, Params, velocity_gamma};
 use crate::recorder::{AudioBlock, BLOCK_FRAMES, RecMsg};
 use crate::reverb::Reverb;
 use crate::synth::{MAX_UNISON, oscillator, saturate};
 
 const MAX_VOICES: usize = 128;
 const BEND_RANGE_CENTS: f32 = 200.0;
-const MASTER_GAIN: f32 = 1.0;
 /// -80 dB: below this a voice is considered finished.
 const SILENCE: f32 = 1e-4;
 /// ln(1000): exponential segments fall by 60 dB over their nominal time.
@@ -40,6 +39,10 @@ const FILTER_UPDATE_FRAMES: usize = 32;
 const GLIDE_CHORD_S: f32 = 0.03;
 /// How fast a mono synth fades the previous note when a new one starts.
 const MONO_HANDOVER_S: f32 = 0.01;
+/// Graphic EQ bandwidth: about one octave per band.
+const EQ_Q: f32 = 1.41;
+/// dB per second an EQ band moves towards its setting (no zipper noise when sweeping).
+const EQ_GLIDE_DB_S: f32 = 200.0;
 
 pub const MAX_LAYERS: usize = 8;
 
@@ -57,6 +60,7 @@ pub enum EngineCmd {
     Mute(LayerId, bool),
     /// Start (`Some`) or stop (`None`) copying the master output to a recorder.
     Record(Option<Sender<RecMsg>>),
+    Master(Master),
 }
 
 /// What the UI asks a new audio stream to build its layers from.
@@ -330,6 +334,20 @@ impl Biquad {
         (self.b0, self.b1, self.b2, self.a1, self.a2) = (b0, b1, b2, a1, a2);
     }
 
+    /// Peaking EQ (RBJ cookbook): `gain_db` around `freq`, flat elsewhere.
+    fn set_peaking(&mut self, freq: f32, gain_db: f32, q: f32, sr: f32) {
+        let w0 = std::f32::consts::TAU * freq.clamp(10.0, 0.45 * sr) / sr;
+        let a = 10f32.powf(gain_db / 40.0);
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha / a;
+        self.b0 = (1.0 + alpha * a) / a0;
+        self.b1 = -2.0 * cos / a0;
+        self.b2 = (1.0 - alpha * a) / a0;
+        self.a1 = self.b1;
+        self.a2 = (1.0 - alpha / a) / a0;
+    }
+
     #[inline]
     fn process(&mut self, ch: usize, x: f32) -> f32 {
         let z = &mut self.z[ch];
@@ -461,6 +479,15 @@ pub struct Engine {
     send: Box<[f32; BLOCK_FRAMES]>,
     reverb_running: bool,
     recorder: Option<Sender<RecMsg>>,
+    sr: f32,
+    /// Master level: target and smoothed gain, applied after the EQ.
+    master_target: f32,
+    master_gain: f32,
+    gain_step: f32,
+    /// One peaking filter per band; a band at 0 dB (and settled) is skipped.
+    eq: [Biquad; EQ_BANDS.len()],
+    eq_db: [f32; EQ_BANDS.len()],
+    eq_target_db: [f32; EQ_BANDS.len()],
     peak: f32,
     peak_fall: f32,
     cmds: Receiver<EngineCmd>,
@@ -531,11 +558,55 @@ impl Engine {
             send: Box::new([0.0; BLOCK_FRAMES]),
             reverb_running: false,
             recorder: None,
+            sr,
+            master_target: 1.0,
+            master_gain: 1.0,
+            gain_step: 1.0 - (-1.0 / (0.01 * sr)).exp(),
+            eq: [Biquad::new(FilterKind::Lpf2p, 20_000.0, 0.0, sr); EQ_BANDS.len()],
+            eq_db: [0.0; EQ_BANDS.len()],
+            eq_target_db: [0.0; EQ_BANDS.len()],
             peak: 0.0,
             peak_fall: exp_coef(2.0, sr),
             cmds,
             garbage,
             stats,
+        }
+    }
+
+    /// Starts with these master settings already in place (no glide from the defaults).
+    pub fn with_master(mut self, m: &Master) -> Self {
+        self.set_master(m);
+        self.master_gain = self.master_target;
+        self.eq_db = self.eq_target_db;
+        for (band, f) in self.eq.iter_mut().enumerate() {
+            f.set_peaking(EQ_BANDS[band], self.eq_db[band], EQ_Q, self.sr);
+        }
+        self
+    }
+
+    fn set_master(&mut self, m: &Master) {
+        self.master_target = db_to_gain(m.level_db());
+        for (band, t) in self.eq_target_db.iter_mut().enumerate() {
+            *t = m.band_db(band);
+        }
+    }
+
+    /// Glides each band towards its setting, once per block.
+    fn update_eq(&mut self, frames: usize) {
+        let max_step = EQ_GLIDE_DB_S * frames as f32 / self.sr;
+        for band in 0..EQ_BANDS.len() {
+            let (cur, target) = (self.eq_db[band], self.eq_target_db[band]);
+            if cur == target {
+                continue;
+            }
+            let next = cur + (target - cur).clamp(-max_step, max_step);
+            self.eq_db[band] = next;
+            if next == 0.0 {
+                // Bypassed from now on: start clean when the band comes back.
+                self.eq[band].z = [[0.0; 2]; 2];
+            } else {
+                self.eq[band].set_peaking(EQ_BANDS[band], next, EQ_Q, self.sr);
+            }
         }
     }
 
@@ -592,6 +663,7 @@ impl Engine {
                 }
                 // The UI keeps its own sender, so dropping ours never wakes a thread from here.
                 EngineCmd::Record(tx) => self.recorder = tx,
+                EngineCmd::Master(m) => self.set_master(&m),
             }
         }
         self.stats.output_us.store(output_delay_us, Relaxed);
@@ -599,11 +671,12 @@ impl Engine {
         self.stats.callbacks.fetch_add(1, Relaxed);
     }
 
-    /// Fills `out` with stereo frames: every layer, shared reverb, limiter.
+    /// Fills `out` with stereo frames: every layer, shared reverb, master EQ and level, limiter.
     pub fn render(&mut self, out: &mut [[f32; 2]]) {
         let n = out.len().min(BLOCK_FRAMES);
         let out = &mut out[..n];
         out.fill([0.0; 2]);
+        self.update_eq(n);
         let send = &mut self.send[..n];
         send.fill(0.0);
         let mut active = 0;
@@ -627,8 +700,15 @@ impl Engine {
                 frame[0] += wl;
                 frame[1] += wr;
             }
+            for (band, f) in self.eq.iter_mut().enumerate() {
+                if self.eq_db[band] != 0.0 {
+                    frame[0] = f.process(0, frame[0]);
+                    frame[1] = f.process(1, frame[1]);
+                }
+            }
+            self.master_gain += (self.master_target - self.master_gain) * self.gain_step;
             for s in frame.iter_mut() {
-                *s = soft_clip(*s * MASTER_GAIN);
+                *s = soft_clip(*s * self.master_gain);
             }
             let level = frame[0].abs().max(frame[1].abs());
             self.peak = if level > self.peak { level } else { self.peak * self.peak_fall };
@@ -1873,6 +1953,52 @@ mod tests {
         rig.run(0.2);
         let hp = rig.rms(0.05);
         assert!(hp < open * 0.1, "high pass: {hp} vs {open}");
+    }
+
+    #[test]
+    fn master_level_and_eq_shape_the_mix() {
+        // A sustained synth sine, quiet enough to stay below the limiter even when boosted.
+        let mut rig = Rig::new(synth("Sine"));
+        rig.send(on(69, 40)); // 440 Hz, between the 250 and 500 Hz bands
+        rig.run(1.5); // past the decay, onto the sustain level
+        let flat = rig.rms(0.05);
+        let mut m = Master::default();
+        m.nudge(0, -12); // -6 dB
+        rig.tx.send(EngineCmd::Master(m)).unwrap();
+        rig.engine.begin_callback(256, 0);
+        rig.run(0.1);
+        let quieter = rig.rms(0.05);
+        assert!((quieter / flat - 0.5).abs() < 0.02, "master -6 dB: {}", quieter / flat);
+
+        let mut m = Master::default();
+        m.nudge(5, 24); // 500 Hz band +12 dB
+        rig.tx.send(EngineCmd::Master(m)).unwrap();
+        rig.engine.begin_callback(256, 0);
+        rig.run(0.2);
+        let boosted = rig.rms(0.05);
+        assert!(boosted > flat * 2.0, "500 Hz boost lifts 440 Hz: {}", boosted / flat);
+
+        let mut m = Master::default();
+        m.nudge(9, -24); // 8 kHz band -12 dB: far away, barely touches 440 Hz
+        rig.tx.send(EngineCmd::Master(m)).unwrap();
+        rig.engine.begin_callback(256, 0);
+        rig.run(0.2);
+        let far = rig.rms(0.05);
+        assert!((far / flat - 1.0).abs() < 0.05, "distant cut leaves it alone: {}", far / flat);
+    }
+
+    #[test]
+    fn peaking_filter_hits_its_gain_at_centre() {
+        let mut f = Biquad::new(FilterKind::Lpf2p, 20_000.0, 0.0, SR as f32);
+        f.set_peaking(1000.0, 6.0, EQ_Q, SR as f32);
+        let mut peak = 0.0f32;
+        for i in 0..9600 {
+            let y = f.process(0, (std::f32::consts::TAU * 1000.0 * i as f32 / SR as f32).sin());
+            if i > 4800 {
+                peak = peak.max(y.abs());
+            }
+        }
+        assert!((20.0 * peak.log10() - 6.0).abs() < 0.1, "{peak}");
     }
 
     #[test]

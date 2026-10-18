@@ -21,7 +21,7 @@ use crate::audio::{self, AudioOut, OutputInfo};
 use crate::engine::{EngineCmd, Garbage, Layer, LayerId, LayerSpec, MAX_LAYERS, Stats};
 use crate::instrument::{self, Instrument, Progress};
 use crate::midi::{self, MidiEvent};
-use crate::params::{ParamId, Params};
+use crate::params::{MASTER_COUNT, Master, ParamId, Params};
 use crate::recorder::{RecMsg, Recording};
 use crate::synth::PRESETS;
 
@@ -116,6 +116,12 @@ pub struct App {
     matrix_scroll: usize,
     /// Where each matrix cell was last drawn, for mouse clicks.
     cell_rects: Vec<(usize, Rect)>,
+    /// Master strip (level + EQ on the whole mix), driven with Ctrl.
+    master: Master,
+    master_sent: Option<Master>,
+    /// Index into the strip: 0 = level, then the EQ bands.
+    master_selected: usize,
+    master_rects: Vec<(usize, Rect)>,
     recording: Option<Recording>,
     /// Kept for a moment after stopping so the engine never holds the last sender: the
     /// queue's memory must be freed here, not on the audio thread.
@@ -176,6 +182,10 @@ impl App {
             selected: 0,
             matrix_scroll: 0,
             cell_rects: Vec::new(),
+            master: Master::default(),
+            master_sent: None,
+            master_selected: 0,
+            master_rects: Vec::new(),
             recording: None,
             rec_keepalive: None,
             held: [false; 128],
@@ -272,6 +282,9 @@ impl App {
             if l.params_sent != Some(l.params) && self.engine_tx.try_send(EngineCmd::Params(l.id, l.params)).is_ok() {
                 l.params_sent = Some(l.params);
             }
+        }
+        if self.master_sent != Some(self.master) && self.engine_tx.try_send(EngineCmd::Master(self.master)).is_ok() {
+            self.master_sent = Some(self.master);
         }
     }
 
@@ -478,6 +491,7 @@ impl App {
             self.output.as_deref(),
             self.buffer_frames(),
             &specs,
+            &self.master,
             self.engine_rx.clone(),
             self.garbage_tx.clone(),
             self.stats.clone(),
@@ -487,6 +501,7 @@ impl App {
                 for l in &mut self.layers {
                     l.params_sent = Some(l.params);
                 }
+                self.master_sent = Some(self.master);
                 // A new engine starts without the recorder.
                 if let Some(rec) = &self.recording {
                     let _ = self.engine_tx.try_send(EngineCmd::Record(Some(rec.sender())));
@@ -599,6 +614,9 @@ impl App {
             }
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && self.on_master_key(key.code) {
+            return;
+        }
         let selected = ParamId::ALL[self.selected];
         let count = ParamId::ALL.len();
         match key.code {
@@ -624,6 +642,22 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Ctrl + arrows/space drive the master strip. Returns whether the key was used.
+    fn on_master_key(&mut self, code: KeyCode) -> bool {
+        let i = self.master_selected;
+        match code {
+            KeyCode::Left => self.master_selected = i.saturating_sub(1),
+            KeyCode::Right => self.master_selected = (i + 1).min(MASTER_COUNT - 1),
+            KeyCode::Up => self.master.nudge(i, 1),
+            KeyCode::Down => self.master.nudge(i, -1),
+            KeyCode::PageUp => self.master.nudge(i, COARSE_STEPS),
+            KeyCode::PageDown => self.master.nudge(i, -COARSE_STEPS),
+            KeyCode::Char(' ') => self.master.reset(i),
+            _ => return false,
+        }
+        true
     }
 
     fn on_popup_key(&mut self, popup: Popup, code: KeyCode) {
@@ -691,6 +725,8 @@ impl App {
                 let pos = Position::new(m.column, m.row);
                 if let Some(&(i, _)) = self.cell_rects.iter().find(|(_, r)| r.contains(pos)) {
                     self.selected = i;
+                } else if let Some(&(i, _)) = self.master_rects.iter().find(|(_, r)| r.contains(pos)) {
+                    self.master_selected = i;
                 } else if let Some(&(i, _)) = self.layer_rects.iter().find(|(_, r)| r.contains(pos)) {
                     self.current = i;
                 }
@@ -698,11 +734,15 @@ impl App {
             }
             _ => return,
         };
+        let steps = if up { -1 } else { 1 };
         if let Some(list) = self.popup_list() {
             if up { list.select_previous() } else { list.select_next() }
+        } else if m.modifiers.contains(KeyModifiers::CONTROL) {
+            // Same direction as the matrix scroll below.
+            self.master.nudge(self.master_selected, steps);
         } else {
             // Reversed on request: matches natural (touchpad) scrolling.
-            self.edit(ParamId::ALL[self.selected], if up { -1 } else { 1 });
+            self.edit(ParamId::ALL[self.selected], steps);
         }
     }
 

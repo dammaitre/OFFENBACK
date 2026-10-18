@@ -12,6 +12,7 @@ use cpal::{BufferSize, DeviceDirection, FromSample, SampleFormat, SizedSample, S
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::engine::{Engine, EngineCmd, Garbage, Layer, LayerSpec, Stats};
+use crate::params::Master;
 
 /// Frames rendered per engine call; the callback loops when the device asks for more.
 const BLOCK: usize = crate::recorder::BLOCK_FRAMES;
@@ -69,6 +70,7 @@ pub fn open(
     query: Option<&str>,
     buffer: Option<u32>,
     layers: &[LayerSpec],
+    master: &Master,
     cmds: Receiver<EngineCmd>,
     garbage: Sender<Garbage>,
     stats: Arc<Stats>,
@@ -108,7 +110,7 @@ pub fn open(
         .iter()
         .map(|l| Layer::new(l.id, config.sample_rate, l.instrument.clone(), &l.params, l.muted))
         .collect();
-    let engine = Engine::new(config.sample_rate, layers, cmds, garbage, stats.clone());
+    let engine = Engine::new(config.sample_rate, layers, cmds, garbage, stats.clone()).with_master(master);
     let stream = match format {
         SampleFormat::F32 => build::<f32>(&device, &config, engine, stats),
         SampleFormat::I16 => build::<i16>(&device, &config, engine, stats),
