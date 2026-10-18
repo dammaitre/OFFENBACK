@@ -31,8 +31,14 @@ const BUFFER_SIZES: [u32; 6] = [32, 64, 128, 256, 512, 1024];
 const DEFAULT_BUFFER: u32 = 128;
 const TEST_NOTE: u8 = 60;
 const TEST_NOTE_LENGTH: Duration = Duration::from_millis(600);
-/// Matrix shape: parameters are laid out row by row.
+/// Matrix shape: parameters are laid out row by row, at most this many per row.
 const MATRIX_COLS: usize = 6;
+
+/// Columns for `count` cells: as few rows as `MATRIX_COLS` allows, filled evenly
+/// (8 cells → 2 rows of 4 rather than 6 + 2).
+fn matrix_cols(count: usize) -> usize {
+    count.div_ceil(count.div_ceil(MATRIX_COLS).max(1)).max(1)
+}
 /// Steps per PgUp/PgDn.
 const COARSE_STEPS: i32 = 10;
 
@@ -110,12 +116,12 @@ pub struct App {
     /// Index into `BUFFER_SIZES`; `None` lets the server choose.
     buffer: Option<usize>,
     test_note_off: Option<Instant>,
-    /// Index into `ParamId::ALL`.
-    selected: usize,
+    /// Selected matrix cell. Kept while hidden (recorded instrument), see `selected_index`.
+    selected: ParamId,
     /// First visible matrix column when the terminal is too narrow for all of them.
     matrix_scroll: usize,
     /// Where each matrix cell was last drawn, for mouse clicks.
-    cell_rects: Vec<(usize, Rect)>,
+    cell_rects: Vec<(ParamId, Rect)>,
     /// Master strip (level + EQ on the whole mix), driven with Ctrl.
     master: Master,
     master_sent: Option<Master>,
@@ -179,7 +185,7 @@ impl App {
             output,
             buffer,
             test_note_off: None,
-            selected: 0,
+            selected: ParamId::ALL[0],
             matrix_scroll: 0,
             cell_rects: Vec::new(),
             master: Master::default(),
@@ -617,29 +623,25 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && self.on_master_key(key.code) {
             return;
         }
-        let selected = ParamId::ALL[self.selected];
-        let count = ParamId::ALL.len();
+        let visible = self.visible_params();
+        let (i, count) = (self.selected_index(&visible), visible.len());
+        let cols = matrix_cols(count);
+        let mut select = |i: usize| self.selected = visible[i];
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('o') => self.open_popup(Popup::Output),
             KeyCode::Char('p') => self.open_popup(Popup::Port),
             KeyCode::Char('r' | 'R') => self.toggle_recording(),
-            KeyCode::Left => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Right => self.selected = (self.selected + 1).min(count - 1),
-            KeyCode::Up => self.selected = self.selected.saturating_sub(MATRIX_COLS),
+            KeyCode::Left => select(i.saturating_sub(1)),
+            KeyCode::Right => select((i + 1).min(count - 1)),
+            KeyCode::Up => select(i.saturating_sub(cols)),
             // The last row may be shorter: land on its last cell rather than not moving.
-            KeyCode::Down if self.selected / MATRIX_COLS < (count - 1) / MATRIX_COLS => {
-                self.selected = (self.selected + MATRIX_COLS).min(count - 1)
-            }
-            KeyCode::Char('+' | '=') => self.edit(selected, 1),
-            KeyCode::Char('-') => self.edit(selected, -1),
-            KeyCode::PageUp => self.edit(selected, COARSE_STEPS),
-            KeyCode::PageDown => self.edit(selected, -COARSE_STEPS),
-            KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => {
-                if self.is_enabled(selected) {
-                    self.layer_mut().params.reset(selected);
-                }
-            }
+            KeyCode::Down if i / cols < (count - 1) / cols => select((i + cols).min(count - 1)),
+            KeyCode::Char('+' | '=') => self.edit(visible[i], 1),
+            KeyCode::Char('-') => self.edit(visible[i], -1),
+            KeyCode::PageUp => self.edit(visible[i], COARSE_STEPS),
+            KeyCode::PageDown => self.edit(visible[i], -COARSE_STEPS),
+            KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => self.layer_mut().params.reset(visible[i]),
             _ => {}
         }
     }
@@ -723,8 +725,8 @@ impl App {
             MouseEventKind::ScrollDown => false,
             MouseEventKind::Down(MouseButton::Left) if self.popup.is_none() => {
                 let pos = Position::new(m.column, m.row);
-                if let Some(&(i, _)) = self.cell_rects.iter().find(|(_, r)| r.contains(pos)) {
-                    self.selected = i;
+                if let Some(&(id, _)) = self.cell_rects.iter().find(|(_, r)| r.contains(pos)) {
+                    self.selected = id;
                 } else if let Some(&(i, _)) = self.master_rects.iter().find(|(_, r)| r.contains(pos)) {
                     self.master_selected = i;
                 } else if let Some(&(i, _)) = self.layer_rects.iter().find(|(_, r)| r.contains(pos)) {
@@ -742,21 +744,26 @@ impl App {
             self.master.nudge(self.master_selected, steps);
         } else {
             // Reversed on request: matches natural (touchpad) scrolling.
-            self.edit(ParamId::ALL[self.selected], steps);
+            let visible = self.visible_params();
+            self.edit(visible[self.selected_index(&visible)], steps);
         }
     }
 
-    /// Envelope and LFO cells only do something on synths.
-    fn is_enabled(&self, id: ParamId) -> bool {
-        !id.synth_only() || self.layer().instrument.synth.is_some()
+    /// Matrix cells for the current layer: envelope, LFO and glide only show on synths.
+    fn visible_params(&self) -> Vec<ParamId> {
+        let synth = self.layer().instrument.synth.is_some();
+        ParamId::ALL.into_iter().filter(|id| synth || !id.synth_only()).collect()
+    }
+
+    /// Position of the selection in `visible`. A hidden selection shows on the nearest
+    /// visible cell before it, and comes back when the layer is a synth again.
+    fn selected_index(&self, visible: &[ParamId]) -> usize {
+        let pos = ParamId::ALL.iter().position(|&p| p == self.selected).unwrap_or(0);
+        ParamId::ALL[..=pos].iter().rev().find_map(|p| visible.iter().position(|v| v == p)).unwrap_or(0)
     }
 
     fn edit(&mut self, id: ParamId, steps: i32) {
-        if self.is_enabled(id) {
-            self.layer_mut().params.nudge(id, steps);
-        } else {
-            self.status = format!("{} only applies to synths (Alt+Enter to choose one)", id.spec().name);
-        }
+        self.layer_mut().params.nudge(id, steps);
     }
 }
 
@@ -783,4 +790,19 @@ fn find_sfz_files() -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matrix_cols;
+
+    #[test]
+    fn matrix_rows_are_balanced() {
+        // Recorded instruments (8 cells) → 4 + 4; synths (16) keep 6 per row.
+        assert_eq!(matrix_cols(8), 4);
+        assert_eq!(matrix_cols(16), 6);
+        assert_eq!(matrix_cols(6), 6);
+        assert_eq!(matrix_cols(7), 4);
+        assert_eq!(matrix_cols(1), 1);
+    }
 }

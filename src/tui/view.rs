@@ -6,9 +6,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Padding, Paragraph};
 
-use super::{App, BUFFER_SIZES, MATRIX_COLS, Popup};
+use super::{App, BUFFER_SIZES, MATRIX_COLS, Popup, matrix_cols};
 use crate::audio;
 use crate::params::{MASTER_COUNT, Master, ParamId};
 
@@ -16,10 +16,11 @@ const ACCENT: Color = Color::Cyan;
 const LIGHT_ON: Color = Color::LightGreen;
 const LIGHT_OFF: Color = Color::DarkGray;
 const CELL_MIN_WIDTH: u16 = 16;
-const CELL_HEIGHT: u16 = 5;
+const CELL_HEIGHT: u16 = 4;
 const LAYER_COL_WIDTH: u16 = 26;
 /// Master level column; the EQ bands share the rest of the strip.
 const MASTER_COL_WIDTH: u16 = 18;
+const MASTER_COL_GAP: u16 = 2;
 /// Piano range shown by the mini keyboard (A0..C8).
 const KEY_LO: u8 = 21;
 const KEY_HI: u8 = 108;
@@ -29,9 +30,9 @@ impl App {
         let [top, layers, main, keyboard, master, bottom] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(3),
-            Constraint::Min(CELL_HEIGHT * ParamId::ALL.len().div_ceil(MATRIX_COLS) as u16 + 2),
+            Constraint::Min(CELL_HEIGHT * self.visible_params().len().div_ceil(MATRIX_COLS) as u16 + 2),
             Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Length(1),
         ])
         .areas(f.area());
@@ -134,26 +135,29 @@ impl App {
     }
 
     fn draw_matrix(&mut self, f: &mut Frame, area: Rect) {
-        let title = format!(" Layer {} · {} ", self.current + 1, self.layer().instrument.name);
+        let title = format!(" {} ", self.layer().instrument.name);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .title(title.bold())
             .title_bottom(Line::from(format!(" {} ", self.status)).dark_gray());
         let inner = block.inner(area);
 
-        let visible = ((inner.width / CELL_MIN_WIDTH).max(1) as usize).min(MATRIX_COLS);
-        let sel_col = self.selected % MATRIX_COLS;
+        let params = self.visible_params();
+        let selected = self.selected_index(&params);
+        let cols = matrix_cols(params.len());
+        let visible = ((inner.width / CELL_MIN_WIDTH).max(1) as usize).min(cols);
+        let sel_col = selected % cols;
         if sel_col < self.matrix_scroll {
             self.matrix_scroll = sel_col;
         } else if sel_col >= self.matrix_scroll + visible {
             self.matrix_scroll = sel_col + 1 - visible;
         }
-        let scroll = self.matrix_scroll.min(MATRIX_COLS - visible);
+        let scroll = self.matrix_scroll.min(cols - visible);
         let mut hints = Vec::new();
         if scroll > 0 {
             hints.push("◀");
         }
-        if scroll + visible < MATRIX_COLS {
+        if scroll + visible < cols {
             hints.push("▶");
         }
         let block = if hints.is_empty() {
@@ -163,15 +167,15 @@ impl App {
         };
         f.render_widget(block, area);
 
-        let rows = ParamId::ALL.len().div_ceil(MATRIX_COLS) as u16;
+        let rows = params.len().div_ceil(cols) as u16;
         let grid_h = (rows * CELL_HEIGHT).min(inner.height);
         let [grid] = Layout::vertical([Constraint::Length(grid_h)]).flex(Flex::Center).areas(inner);
         // Fill splits the leftover columns evenly instead of leaving a gap on the right.
         let columns = Layout::horizontal(vec![Constraint::Fill(1); visible]).split(grid);
 
         self.cell_rects.clear();
-        for (i, &id) in ParamId::ALL.iter().enumerate() {
-            let (row, col) = ((i / MATRIX_COLS) as u16, i % MATRIX_COLS);
+        for (i, &id) in params.iter().enumerate() {
+            let (row, col) = ((i / cols) as u16, i % cols);
             if col < scroll || col >= scroll + visible {
                 continue;
             }
@@ -180,8 +184,8 @@ impl App {
             if rect.height < 3 {
                 continue;
             }
-            self.cell_rects.push((i, rect));
-            self.draw_cell(f, rect, id, i == self.selected);
+            self.cell_rects.push((id, rect));
+            self.draw_cell(f, rect, id, i == selected);
         }
     }
 
@@ -190,17 +194,12 @@ impl App {
         let params = &self.layer().params;
         let value = params.get(id);
         let changed = !params.is_default(id);
-        let enabled = self.is_enabled(id);
         let border = if selected {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(Color::DarkGray)
         };
-        let name = match (selected, enabled) {
-            (true, _) => spec.name.bold().fg(ACCENT),
-            (false, true) => Span::raw(spec.name),
-            (false, false) => spec.name.dark_gray(),
-        };
+        let name = if selected { spec.name.bold().fg(ACCENT) } else { Span::raw(spec.name) };
         let block = Block::bordered()
             .border_type(if selected { BorderType::Thick } else { BorderType::Rounded })
             .border_style(border)
@@ -209,21 +208,11 @@ impl App {
         f.render_widget(block, area);
 
         let gauge_w = inner.width.saturating_sub(2) as usize;
-        let lines = if enabled {
-            let value_style = if changed { Style::new().fg(Color::Yellow).bold() } else { Style::new().bold() };
-            vec![
-                Line::styled(spec.format(value), value_style).centered(),
-                Line::raw(""),
-                gauge(gauge_w, spec.to_norm(spec.default), spec.to_norm(value), selected).centered(),
-            ]
-        } else {
-            // Greyed out: the instrument's own recording decides this.
-            vec![
-                Line::styled(spec.format(value), Style::new().fg(Color::DarkGray)).centered(),
-                Line::styled("synth only", Style::new().fg(Color::DarkGray).italic()).centered(),
-                Line::styled("─".repeat(gauge_w), Style::new().fg(Color::DarkGray)).centered(),
-            ]
-        };
+        let value_style = if changed { Style::new().fg(Color::Yellow).bold() } else { Style::new().bold() };
+        let lines = vec![
+            Line::styled(spec.format(value), value_style).centered(),
+            gauge(gauge_w, spec.to_norm(spec.default), spec.to_norm(value), selected).centered(),
+        ];
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -255,21 +244,30 @@ impl App {
         f.render_widget(Paragraph::new(vec![Line::from(top), Line::from(bottom)]), kb);
     }
 
-    /// Thin strip: a rule with the keys, then per control a "label value" row and a gauge.
+    /// Thick-bordered strip: per control a "label value" row and a gauge, keys in the border.
     fn draw_master(&mut self, f: &mut Frame, area: Rect) {
-        let [rule, labels, gauges] = Layout::vertical([Constraint::Length(1); 3]).areas(area);
-        let title = Line::from(vec!["─ ".dark_gray(), "Master bus".bold(), " ".into()]);
-        let keys = Line::from(" Ctrl+←→ select  Ctrl+↑↓/scroll adjust  Ctrl+Space reset ─").dark_gray();
-        let keys_w = keys.width() as u16;
-        f.render_widget(Line::from("─".repeat(rule.width as usize)).dark_gray(), rule);
-        f.render_widget(title, rule);
-        if rule.width > keys_w + 14 {
-            f.render_widget(keys, Rect { x: rule.right() - keys_w, width: keys_w, ..rule });
-        }
+        let block = Block::bordered()
+            .border_type(BorderType::Thick)
+            .border_style(Style::new().fg(Color::Gray))
+            .padding(Padding::horizontal(1))
+            .title(" Master bus ".bold())
+            .title_bottom(Line::from(" Ctrl+←→ select  Ctrl+↑↓/scroll adjust  Ctrl+Space reset ").dark_gray().right_aligned());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let [labels, gauges] = Layout::vertical([Constraint::Length(1); 2]).areas(inner);
 
         let mut widths = vec![Constraint::Length(MASTER_COL_WIDTH)];
         widths.extend([Constraint::Fill(1); MASTER_COUNT - 1]);
-        let columns = Layout::horizontal(widths).spacing(1).split(labels);
+        let columns = Layout::horizontal(widths).spacing(MASTER_COL_GAP).split(labels);
+        // Divider between the level and the EQ bands.
+        if let Some(&first) = columns.first()
+            && inner.width > first.width + MASTER_COL_GAP
+        {
+            let x = first.right() + MASTER_COL_GAP / 2;
+            for y in [labels.y, gauges.y] {
+                f.render_widget(Line::from("│").dark_gray(), Rect { x, y, width: 1, height: 1 });
+            }
+        }
         self.master_rects.clear();
         for (i, &col) in columns.iter().enumerate() {
             let spec = Master::spec(i);
