@@ -3,6 +3,7 @@ mod engine;
 mod instrument;
 mod midi;
 mod params;
+mod profile;
 mod recorder;
 mod reverb;
 mod sfz;

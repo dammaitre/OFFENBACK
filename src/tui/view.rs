@@ -60,6 +60,10 @@ impl App {
             "   Output ".dim(),
             Span::raw(output).bold(),
         ]);
+        let mut left = left;
+        if let Some(name) = &self.profile_name {
+            left.extend(["   Profile ".dim(), Span::raw(name.clone()).bold()]);
+        }
         let mut right = vec![];
         if let Some(rec) = &self.recording {
             let t = rec.elapsed().as_secs();
@@ -88,7 +92,10 @@ impl App {
             let rect = Rect { x: area.x + k as u16 * LAYER_COL_WIDTH, width: LAYER_COL_WIDTH, ..area }.intersection(area);
             let l = &self.layers[i];
             let selected = i == self.current;
-            let loading = self.loading.as_ref().filter(|ld| ld.layer == l.id);
+            let loading = self
+                .loading
+                .as_ref()
+                .filter(|ld| l.source.as_ref() == Some(&super::Source::Sfz(ld.path.clone())));
             let (border, text) = match (selected, l.muted) {
                 (_, true) => (Style::new().fg(Color::DarkGray), Style::new().fg(Color::DarkGray).italic()),
                 (true, false) => (Style::new().fg(ACCENT).bold(), Style::new().fg(ACCENT).bold()),
@@ -305,7 +312,8 @@ impl App {
             [Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(ACCENT)), Span::raw(format!(" {label}  "))]
         };
         let record = if self.recording.is_some() { "Stop rec" } else { "Record" };
-        let mut spans: Vec<Span> = [key("o", "Output"), key("p", "Port"), key("r", record), key("q", "Quit")]
+        let mut spans: Vec<Span> =
+            [key("o", "Output"), key("p", "Port"), key("r", record), key("s", "Save"), key("l", "Load"), key("q", "Quit")]
             .into_iter()
             .flatten()
             .collect();
@@ -317,11 +325,16 @@ impl App {
     }
 
     fn draw_popup(&mut self, f: &mut Frame, popup: Popup, over: Rect) {
+        if popup == Popup::Save {
+            return self.draw_save_popup(f, over);
+        }
         let extra = if popup == Popup::Output { 4 } else { 0 };
         let list_len = match popup {
             Popup::Port => self.ports.len(),
             Popup::Output => self.outputs.len(),
             Popup::Instrument => self.instruments.len(),
+            Popup::Load => self.profiles.len(),
+            Popup::Save => 0,
         } as u16;
         let width = (over.width * 4 / 5).max(40).min(over.width);
         let height = (list_len.max(1) + extra + 3).min(over.height);
@@ -333,6 +346,8 @@ impl App {
             Popup::Port => (" MIDI input ", " ↑↓ select  ⏎ connect  r refresh  esc close "),
             Popup::Output => (" Audio output ", " ⏎ use  [ ] buffer  t test  l reset worst  esc close "),
             Popup::Instrument => (" Instrument for this layer ", " ↑↓ select  ⏎ load  r refresh  esc close "),
+            Popup::Load => (" Load profile ", " ↑↓ select  ⏎ load (replaces every layer)  r refresh  esc close "),
+            Popup::Save => unreachable!("drawn by draw_save_popup"),
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -377,6 +392,12 @@ impl App {
                     .collect();
                 (items, &mut self.instrument_list, "No .sfz file found in ~/Sounds/SFZ.")
             }
+            Popup::Load => {
+                let current = self.profile_name.as_deref();
+                let items = self.profiles.iter().map(|n| item(n.clone(), None, Some(n.as_str()) == current)).collect();
+                (items, &mut self.profile_list, "No profile saved yet. Press s in the main screen to save one.")
+            }
+            Popup::Save => unreachable!("drawn by draw_save_popup"),
         };
         if list_len == 0 {
             f.render_widget(Paragraph::new(empty).dim(), list_area);
@@ -389,6 +410,34 @@ impl App {
         if popup == Popup::Output {
             self.draw_audio_info(f, info_area);
         }
+    }
+
+    /// Name field plus where the file goes.
+    fn draw_save_popup(&self, f: &mut Frame, over: Rect) {
+        let width = (over.width * 3 / 5).max(40).min(over.width);
+        let [area] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(over);
+        let [area] = Layout::vertical([Constraint::Length(5)]).flex(Flex::Center).areas(area);
+        f.render_widget(Clear, area);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(ACCENT))
+            .title(" Save profile ".bold())
+            .title_bottom(Line::from(" type a name  ⏎ save  esc cancel ").dim());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let name = crate::profile::sanitize_name(&self.save_name);
+        let target = if name.is_empty() {
+            Span::raw(" layers, instruments, settings and master").dim()
+        } else if crate::profile::path(&name).exists() {
+            Span::raw(format!(" replaces profiles/{name}.json")).yellow()
+        } else {
+            Span::raw(format!(" → profiles/{name}.json")).dim()
+        };
+        let lines = vec![
+            Line::from(vec![" Name ".dim(), Span::raw(self.save_name.clone()).bold(), Span::styled("▏", Style::new().fg(ACCENT))]),
+            Line::from(target),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_audio_info(&self, f: &mut Frame, area: Rect) {

@@ -62,6 +62,10 @@ impl ParamId {
     pub fn spec(self) -> &'static Spec {
         &SPECS[self as usize]
     }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|id| id.spec().key == key)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +79,8 @@ pub enum Scale {
 
 pub struct Spec {
     pub name: &'static str,
+    /// Stable identifier in saved profiles; never change it once released.
+    pub key: &'static str,
     pub min: f32,
     pub max: f32,
     pub default: f32,
@@ -89,6 +95,7 @@ pub struct Spec {
 const SPECS: [Spec; 16] = [
     Spec {
         name: "Volume",
+        key: "volume",
         min: -48.0,
         max: 12.0,
         default: 0.0,
@@ -99,6 +106,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Attack",
+        key: "attack",
         min: 0.0,
         max: 5.0,
         default: 0.005,
@@ -109,6 +117,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Decay",
+        key: "decay",
         min: 0.01,
         max: 10.0,
         default: 0.4,
@@ -119,6 +128,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Sustain",
+        key: "sustain",
         min: 0.0,
         max: 100.0,
         default: 70.0,
@@ -129,6 +139,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Release",
+        key: "release",
         min: 0.01,
         max: 10.0,
         default: 0.3,
@@ -139,6 +150,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Reverb",
+        key: "reverb",
         min: 0.0,
         max: 100.0,
         default: 0.0,
@@ -149,6 +161,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Transpose",
+        key: "transpose",
         min: -24.0,
         max: 24.0,
         default: 0.0,
@@ -159,6 +172,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Detune",
+        key: "detune",
         min: -100.0,
         max: 100.0,
         default: 0.0,
@@ -169,6 +183,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Low pass",
+        key: "low_pass",
         min: 100.0,
         max: 20_000.0,
         default: 20_000.0,
@@ -179,6 +194,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "High pass",
+        key: "high_pass",
         min: 20.0,
         max: 5_000.0,
         default: 20.0,
@@ -189,6 +205,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Velocity",
+        key: "velocity",
         min: -100.0,
         max: 100.0,
         default: 0.0,
@@ -199,6 +216,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Resonance",
+        key: "resonance",
         min: 0.0,
         max: 18.0,
         default: 0.0,
@@ -209,6 +227,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "LFO",
+        key: "lfo",
         min: 0.0,
         max: 100.0,
         default: 0.0,
@@ -219,6 +238,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "LFO rate",
+        key: "lfo_rate",
         min: 0.1,
         max: 20.0,
         default: 5.5,
@@ -229,6 +249,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Filter env",
+        key: "filter_env",
         min: 0.0,
         max: 8.0,
         default: 0.0,
@@ -239,6 +260,7 @@ const SPECS: [Spec; 16] = [
     },
     Spec {
         name: "Glide",
+        key: "glide",
         min: 0.0,
         max: 2.0,
         default: 0.0,
@@ -349,6 +371,7 @@ pub const MASTER_COUNT: usize = 1 + EQ_BANDS.len();
 
 const MASTER_LEVEL: Spec = Spec {
     name: "Master",
+    key: "level",
     min: -48.0,
     max: 12.0,
     default: 0.0,
@@ -360,6 +383,7 @@ const MASTER_LEVEL: Spec = Spec {
 
 const EQ_GAIN: Spec = Spec {
     name: "EQ",
+    key: "eq",
     min: -12.0,
     max: 12.0,
     default: 0.0,
@@ -406,6 +430,12 @@ impl Master {
 
     pub fn nudge(&mut self, i: usize, steps: i32) {
         self.values[i] = Self::spec(i).nudged(self.values[i], steps);
+    }
+
+    /// Sets control `i` to `value`, clamped to its range (profiles).
+    pub fn set(&mut self, i: usize, value: f32) {
+        let spec = Self::spec(i);
+        self.values[i] = value.clamp(spec.min, spec.max);
     }
 
     pub fn reset(&mut self, i: usize) {

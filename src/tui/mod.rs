@@ -2,6 +2,7 @@
 
 mod view;
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -22,6 +23,7 @@ use crate::engine::{EngineCmd, Garbage, Layer, LayerId, LayerSpec, MAX_LAYERS, S
 use crate::instrument::{self, Instrument, Progress};
 use crate::midi::{self, MidiEvent};
 use crate::params::{MASTER_COUNT, Master, ParamId, Params};
+use crate::profile::{self, InstrumentRef, LayerProfile, Profile};
 use crate::recorder::{RecMsg, Recording};
 use crate::synth::PRESETS;
 
@@ -47,6 +49,8 @@ enum Popup {
     Port,
     Output,
     Instrument,
+    Load,
+    Save,
 }
 
 struct Connection {
@@ -63,8 +67,8 @@ enum Source {
 }
 
 struct Loading {
-    /// Layer that receives the instrument (if it still exists when loading ends).
-    layer: LayerId,
+    /// Every layer whose source is still this file when loading ends receives it.
+    path: PathBuf,
     name: String,
     progress: Arc<Progress>,
     handle: JoinHandle<Result<Instrument>>,
@@ -102,11 +106,19 @@ pub struct App {
     /// Instrument for Alt+N.
     piano: Option<PathBuf>,
     loading: Option<Loading>,
+    /// SFZ files waiting for `loading` to finish, one at a time.
+    load_queue: VecDeque<PathBuf>,
     /// Memory the audio thread is done with; dropped here, off the real-time thread.
     garbage_tx: Sender<Garbage>,
     garbage_rx: Receiver<Garbage>,
     instruments: Vec<Source>,
     instrument_list: ListState,
+    /// Saved profiles (names) for the Load window, and the name typed in the Save window.
+    profiles: Vec<String>,
+    profile_list: ListState,
+    save_name: String,
+    /// Last profile loaded or saved.
+    profile_name: Option<String>,
     audio: Option<AudioOut>,
     audio_error: Option<String>,
     outputs: Vec<OutputInfo>,
@@ -174,10 +186,15 @@ impl App {
             layer_rects: Vec::new(),
             piano,
             loading: None,
+            load_queue: VecDeque::new(),
             garbage_tx,
             garbage_rx,
             instruments: Vec::new(),
             instrument_list: ListState::default(),
+            profiles: Vec::new(),
+            profile_list: ListState::default(),
+            save_name: String::new(),
+            profile_name: None,
             audio: None,
             audio_error: None,
             outputs: Vec::new(),
@@ -328,10 +345,6 @@ impl App {
             self.add_layer(inst, Some(Source::Synth(0)), Params::default());
             return;
         };
-        if self.loading.is_some() && self.shared_instrument(&path).is_none() {
-            self.status = "wait for the current instrument to finish loading".into();
-            return;
-        }
         let name = path.file_stem().map_or("piano".into(), |s| s.to_string_lossy().into_owned());
         let placeholder = Arc::new(Instrument::empty(name));
         if let Some(id) = self.add_layer(placeholder, Some(Source::Sfz(path.clone())), Params::default()) {
@@ -394,27 +407,37 @@ impl App {
         }
     }
 
-    /// Loads an SFZ into layer `id`, sharing it if another layer already has it.
+    /// Loads an SFZ into layer `id`, sharing it if another layer already has it. While
+    /// another file loads, this one waits its turn.
     fn load_instrument(&mut self, path: PathBuf, id: LayerId) {
         if let Some(inst) = self.shared_instrument(&path) {
             self.status = format!("{} shared with another layer", inst.name);
             self.set_layer_instrument(id, inst, Some(Source::Sfz(path)));
             return;
         }
-        if self.loading.is_some() {
-            self.status = "wait for the current instrument to finish loading".into();
-            return;
+        if let Some(i) = self.layer_index(id) {
+            self.layers[i].source = Some(Source::Sfz(path.clone()));
         }
+        match &self.loading {
+            // Already on its way: the result goes to every layer using it.
+            Some(l) if l.path == path => {}
+            Some(_) => {
+                if !self.load_queue.contains(&path) {
+                    self.load_queue.push_back(path);
+                }
+            }
+            None => self.start_loading(path),
+        }
+    }
+
+    fn start_loading(&mut self, path: PathBuf) {
         let progress = Arc::new(Progress::default());
         let name = path.file_stem().map_or("instrument".into(), |s| s.to_string_lossy().into_owned());
         let p = progress.clone();
         let load_path = path.clone();
         let handle = std::thread::spawn(move || instrument::load_sfz(&load_path, &p));
         self.status = format!("loading {name}…");
-        if let Some(i) = self.layer_index(id) {
-            self.layers[i].source = Some(Source::Sfz(path));
-        }
-        self.loading = Some(Loading { layer: id, name, progress, handle });
+        self.loading = Some(Loading { path, name, progress, handle });
     }
 
     fn poll_loading(&mut self) {
@@ -430,12 +453,127 @@ impl App {
                     inst.regions.len(),
                     inst.memory_bytes() >> 20
                 );
-                let source = self.layer_index(loading.layer).and_then(|i| self.layers[i].source.clone());
-                self.set_layer_instrument(loading.layer, Arc::new(inst), source);
+                let inst = Arc::new(inst);
+                let source = Some(Source::Sfz(loading.path));
+                let ids: Vec<LayerId> = self.layers.iter().filter(|l| l.source == source).map(|l| l.id).collect();
+                for id in ids {
+                    self.set_layer_instrument(id, inst.clone(), source.clone());
+                }
             }
             Ok(Err(e)) => self.status = format!("cannot load {}: {e:#}", loading.name),
             Err(_) => self.status = format!("loading {} crashed", loading.name),
         }
+        // Next in line, unless no layer wants it any more.
+        while let Some(path) = self.load_queue.pop_front() {
+            let wanted = Some(Source::Sfz(path.clone()));
+            if self.layers.iter().any(|l| l.source == wanted && l.instrument.regions.is_empty()) {
+                self.start_loading(path);
+                break;
+            }
+        }
+    }
+
+    // --- Profiles -----------------------------------------------------------------------
+
+    fn snapshot(&self) -> Profile {
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| LayerProfile {
+                instrument: match &l.source {
+                    Some(Source::Sfz(path)) => InstrumentRef::Sfz(path.clone()),
+                    Some(Source::Synth(i)) => InstrumentRef::Synth(PRESETS[*i].name.into()),
+                    None => InstrumentRef::Synth(PRESETS[0].name.into()),
+                },
+                params: l.params,
+                muted: l.muted,
+            })
+            .collect();
+        Profile { layers, current: self.current, master: self.master }
+    }
+
+    fn save_profile(&mut self) {
+        let name = profile::sanitize_name(&self.save_name);
+        if name.is_empty() {
+            self.status = "type a name for the profile".into();
+            return;
+        }
+        match profile::save(&name, &self.snapshot()) {
+            Ok(path) => {
+                self.status = format!("profile saved to {}", path.display());
+                self.profile_name = Some(name);
+                self.popup = None;
+            }
+            Err(e) => self.status = format!("cannot save: {e:#}"),
+        }
+    }
+
+    fn load_profile(&mut self, name: &str) {
+        let p = match profile::load(name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("cannot load profile: {e:#}");
+                return;
+            }
+        };
+        // Old layers stay in `old` until the end, so instruments they share with the profile
+        // are reused instead of reloaded.
+        let old = std::mem::take(&mut self.layers);
+        for l in &old {
+            let _ = self.engine_tx.send(EngineCmd::RemoveLayer(l.id));
+        }
+        self.load_queue.clear();
+        self.current = 0;
+        let mut unknown = Vec::new();
+        let mut to_load = Vec::new();
+        for lp in p.layers.iter().take(MAX_LAYERS) {
+            let (inst, source) = match &lp.instrument {
+                InstrumentRef::Synth(name) => {
+                    let i = PRESETS.iter().position(|pr| pr.name == name).unwrap_or_else(|| {
+                        unknown.push(name.clone());
+                        0
+                    });
+                    (Arc::new(Instrument::synth(PRESETS[i].clone())), Source::Synth(i))
+                }
+                InstrumentRef::Sfz(path) => {
+                    let source = Source::Sfz(path.clone());
+                    let loaded = old
+                        .iter()
+                        .chain(&self.layers)
+                        .find(|l| l.source.as_ref() == Some(&source) && !l.instrument.regions.is_empty())
+                        .map(|l| l.instrument.clone());
+                    match loaded {
+                        Some(inst) => (inst, source),
+                        None => {
+                            let name = path.file_stem().map_or("instrument".into(), |s| s.to_string_lossy().into_owned());
+                            (Arc::new(Instrument::empty(name)), source)
+                        }
+                    }
+                }
+            };
+            let needs_load = matches!(source, Source::Sfz(_)) && inst.regions.is_empty();
+            if let Some(id) = self.add_layer(inst, Some(source), lp.params) {
+                if lp.muted {
+                    self.layers[self.current].muted = true;
+                    let _ = self.engine_tx.send(EngineCmd::Mute(id, true));
+                }
+                if needs_load && let InstrumentRef::Sfz(path) = &lp.instrument {
+                    to_load.push((path.clone(), id));
+                }
+            }
+        }
+        self.current = p.current.min(self.layers.len() - 1);
+        self.master = p.master;
+        self.profile_name = Some(name.to_owned());
+        self.status = if unknown.is_empty() {
+            format!("profile {name} loaded")
+        } else {
+            format!("profile {name} loaded; unknown synth {} replaced by {}", unknown.join(", "), PRESETS[0].name)
+        };
+        for (path, id) in to_load {
+            self.load_instrument(path, id);
+        }
+        drop(old);
     }
 
     // --- Audio, recording ---------------------------------------------------------------
@@ -574,6 +712,12 @@ impl App {
             Popup::Port => self.refresh_ports(),
             Popup::Output => self.refresh_outputs(),
             Popup::Instrument => self.refresh_instruments(),
+            Popup::Load => {
+                self.profiles = profile::list();
+                let current = self.profile_name.as_ref().and_then(|n| self.profiles.iter().position(|p| p == n));
+                self.profile_list.select(current.or((!self.profiles.is_empty()).then_some(0)));
+            }
+            Popup::Save => self.save_name = self.profile_name.clone().unwrap_or_default(),
         }
         self.popup = Some(popup);
     }
@@ -583,6 +727,8 @@ impl App {
             Popup::Port => Some(&mut self.port_list),
             Popup::Output => Some(&mut self.output_list),
             Popup::Instrument => Some(&mut self.instrument_list),
+            Popup::Load => Some(&mut self.profile_list),
+            Popup::Save => None,
         }
     }
 
@@ -603,9 +749,10 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        if let Some(popup) = self.popup {
-            self.on_popup_key(popup, key.code);
-            return;
+        match self.popup {
+            Some(Popup::Save) => return self.on_save_key(key.code),
+            Some(popup) => return self.on_popup_key(popup, key.code),
+            None => {}
         }
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
@@ -632,6 +779,8 @@ impl App {
             KeyCode::Char('o') => self.open_popup(Popup::Output),
             KeyCode::Char('p') => self.open_popup(Popup::Port),
             KeyCode::Char('r' | 'R') => self.toggle_recording(),
+            KeyCode::Char('s' | 'S') => self.open_popup(Popup::Save),
+            KeyCode::Char('l' | 'L') => self.open_popup(Popup::Load),
             KeyCode::Left => select(i.saturating_sub(1)),
             KeyCode::Right => select((i + 1).min(count - 1)),
             KeyCode::Up => select(i.saturating_sub(cols)),
@@ -660,6 +809,19 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// The Save window is a text field: every printable key goes into the name.
+    fn on_save_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => self.popup = None,
+            KeyCode::Enter => self.save_profile(),
+            KeyCode::Backspace => {
+                self.save_name.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() => self.save_name.push(c),
+            _ => {}
+        }
     }
 
     fn on_popup_key(&mut self, popup: Popup, code: KeyCode) {
@@ -716,6 +878,13 @@ impl App {
                     self.popup = None;
                 }
             }
+            Popup::Load => {
+                if let Some(name) = self.profile_list.selected().and_then(|i| self.profiles.get(i)).cloned() {
+                    self.load_profile(&name);
+                    self.popup = None;
+                }
+            }
+            Popup::Save => self.save_profile(),
         }
     }
 
