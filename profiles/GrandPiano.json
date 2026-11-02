@@ -26,7 +26,7 @@
         "volume": 0.0,
         "transpose": 0.0,
         "detune": 0.0,
-        "velocity": 20.0,
+        "velocity": -100.0,
         "reverb": 19.0,
         "glide": 0.0,
         "attack": 0.005,
